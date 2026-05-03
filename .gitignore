@@ -1,0 +1,33 @@
+# Data & output folders
+foto/
+dpm/
+hasil/
+periode billing/
+database.xlsb
+
+# Runtime files
+cookie.json
+stand_cache.json
+stand_results_tesseract.csv
+
+# Driver
+chromedriver.exe
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+*.swp
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Other
+instal ini.txt
+CLAUDE.md
+.claude/
