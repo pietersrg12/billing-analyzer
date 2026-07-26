@@ -1,88 +1,160 @@
+"""
+Loader DPM untuk format Monitoring_DLPD_Detail (PLN).
+
+Format input yang didukung: file Excel hasil export Monitoring DLPD,
+dengan kolom kunci (lowercase): idpel, sahlwbp, pemkwh, daya, tarif,
+keterangan_dlpd, thblrek, slalwbp, jamnyala.
+
+Loader memetakan kolom-kolom tersebut ke schema internal aplikasi
+(uppercase: IDPEL, STAND_KINI, PEMAKAIAN, DAYA, TARIF, KELAINAN) yang
+dipakai oleh analyzer, photo, dan excel module.
+"""
+
+import os
+
 import pandas as pd
 
-def detect_mode(columns):
+# Kolom wajib di file DPM (semua lowercase, sesuai export Monitoring DLPD)
+REQUIRED_COLS = {"idpel", "sahlwbp", "pemkwh", "daya", "tarif", "keterangan_dlpd"}
 
-    cols = set(columns)
+# Pemetaan kolom file -> schema internal aplikasi
+COL_MAP = {
+    "idpel":           "IDPEL",
+    "sahlwbp":         "STAND_KINI",
+    "pemkwh":          "PEMAKAIAN",
+    "daya":            "DAYA",
+    "tarif":           "TARIF",
+    "keterangan_dlpd": "KELAINAN",
+}
 
-    if {"SAHLWBP","LWBPPAKAI"}.issubset(cols):
-        return "resmi"
 
-    if {"STAN_METER","PEMKWH","KDBACA"}.issubset(cols):
-        return "belum"
+def _read_excel_auto(path):
+    """Baca Excel, pilih engine berdasarkan ekstensi."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".xlsb":
+        return pd.read_excel(path, engine="pyxlsb")
+    return pd.read_excel(path)
 
-    raise ValueError("Format DPM tidak dikenali")
+
+def read_blth(dpm_path):
+    """Ambil BLTH (thblrek) dari file DPM untuk auto-fill UI.
+
+    Return string 6 digit (mis. '202606') atau None bila gagal.
+    """
+    try:
+        df = pd.read_excel(dpm_path, usecols=["thblrek"], nrows=1)
+        val = df["thblrek"].iloc[0]
+        if pd.isna(val):
+            return None
+        return str(int(val))
+    except Exception:
+        return None
 
 
 def load_data(dpm_path, db_path):
+    """Load DPM + database, lakukan mapping & cleaning.
 
-    dpm = pd.read_excel(dpm_path)
-    db  = pd.read_excel(db_path)
+    Returns
+    -------
+    dpm : DataFrame dengan kolom IDPEL, STAND_KINI, PEMAKAIAN, DAYA, TARIF, KELAINAN
+    db  : DataFrame database historis (IDPEL, BULAN, STAND, PEMAKAIAN, DAYA, KEY)
+    """
+
+    dpm = _read_excel_auto(dpm_path)
+    db = _read_excel_auto(db_path)
 
     # =========================
-    # AUTO DETECT
+    # VALIDASI FORMAT
     # =========================
-    mode = detect_mode(dpm.columns)
-    print(f"MODE TERDETEKSI: {mode.upper()}")
+    cols_lower = {c.lower() for c in dpm.columns}
+    missing = REQUIRED_COLS - cols_lower
+    if missing:
+        raise ValueError(
+            "Format DPM tidak dikenali. "
+            f"Kolom hilang: {sorted(missing)}. "
+            "Pastikan file adalah export Monitoring_DLPD_Detail."
+        )
+
+    # Normalisasi nama kolom ke lowercase agar matching deterministic
+    dpm.columns = [c.lower() for c in dpm.columns]
 
     # =========================
-    # MAPPING
+    # MAPPING & SELEKSI KOLOM
     # =========================
-    if mode == "resmi":
-
-        dpm = dpm.rename(columns={
-            "IDPEL": "IDPEL",
-            "SAHLWBP": "STAND_KINI",
-            "LWBPPAKAI": "PEMAKAIAN",
-            "DAYA": "DAYA",
-            "TARIF": "TARIF",
-            "KELAINAN_BC_METER": "KELAINAN"
-        })
-
-    elif mode == "belum":
-
-        dpm = dpm.rename(columns={
-            "IDPEL": "IDPEL",
-            "STAN_METER": "STAND_KINI",
-            "PEMKWH": "PEMAKAIAN",
-            "DAYA": "DAYA",
-            "TARIF": "TARIF",
-            "KDBACA": "KELAINAN"
-        })
-
-        kode_map = {
-            "A": "KWH METER MACET",
-            "B": "KWH METER MUNDUR",
-            "C": "KWH METER TIDAK ADA",
-            "D": "PELANGGAN TIDAK SESUAI RBM",
-            "F": "RUMAH KOSONG",
-            "H": "KWH METER BURAM/PECAH",
-            "I": "KWH METER DIDALAM BANGUNAN",
-            "J": "SEGEL TIDAK ADA",
-            "K": "MCB PERLU DIPERIKSA",
-            "L": "TARIF TIDAK SESUAI",
-            "M": "KWH KURANG TAGIH",
-            "N": "KWH LEBIH TAGIH",
-            "U": "PEMADAMAN",
-            "W": "BENCANA",
-            "Z": "NORMAL",
-            "1": "KWH METER TINGGI",
-            "2": "GANTI KWH METER",
-            "3": "ANJING GALAK",
-            "7": "STAN DARI PELANGGAN"
-        }
-
-        dpm["KELAINAN"] = dpm["KELAINAN"].map(kode_map).fillna("")
+    dpm = dpm[list(COL_MAP.keys())].rename(columns=COL_MAP)
 
     # =========================
     # CLEANING
     # =========================
+    dpm["IDPEL"] = dpm["IDPEL"].astype(str).str.strip()
 
-    dpm["IDPEL"] = dpm["IDPEL"].astype(str)
-
-    for col in ["STAND_KINI","PEMAKAIAN","DAYA"]:
+    for col in ["STAND_KINI", "PEMAKAIAN", "DAYA"]:
         dpm[col] = pd.to_numeric(dpm[col], errors="coerce").fillna(0)
+
+    dpm["TARIF"] = dpm["TARIF"].fillna("").astype(str).str.strip()
+    dpm["KELAINAN"] = dpm["KELAINAN"].fillna("").astype(str).str.strip()
 
     db["IDPEL"] = db["IDPEL"].astype(str)
     db["BULAN"] = db["BULAN"].astype(int)
 
-    return dpm, db, mode
+    return dpm, db
+
+
+def load_stanbaca_data(path):
+    """Load database stan baca (hasil baca meter asli per kejadian baca,
+    sebelum potongan billing). Skema sumber (export "STAN BACA"): IDPEL,
+    STAN METER, STAN BACA, TGL BACA, KD BACA - satu baris per kejadian baca
+    (bisa lebih dari satu per bulan per IDPEL).
+
+    STAND diambil dari kolom STAN METER (angka mentah hasil baca fisik
+    meter di lapangan) - BUKAN STAN BACA, yang merupakan angka hasil
+    proses/koreksi sistem billing (bisa berbeda signifikan dari STAN METER
+    kalau KD BACA menandakan ada koreksi, mis. kode N/"KWH LEBIH TAGIH").
+
+    Siklus baca PLN: pembacaan fisik dilakukan di akhir bulan (median
+    tanggal 26), dan hasilnya dipakai untuk REKENING BULAN BERIKUTNYA -
+    bukan bulan saat baca terjadi. Jadi BULAN (bulan rekening) = bulan
+    TGL BACA + 1, supaya sebanding dengan BULAN di database.xlsb (yang
+    memang berisi bulan rekening).
+
+    Kalau ada lebih dari satu baca dalam bulan rekening yang sama untuk 1
+    IDPEL, ambil yang paling baru (by TGL BACA) supaya konsisten dengan
+    cara database.xlsb menyimpan satu STAND per IDPEL per bulan.
+
+    Return None (bukan raise) kalau file tidak ada, atau kolom yang
+    dibutuhkan tidak ditemukan, supaya pipeline bisa lanjut tanpa fitur ini
+    (graceful degradation, sama seperti core/classifier.py dan
+    core/reader.py).
+    """
+    if not path or not os.path.exists(path):
+        return None
+
+    try:
+        sb = _read_excel_auto(path)
+    except Exception:
+        return None
+
+    sb.columns = [c.strip().lower() for c in sb.columns]
+    if not {"idpel", "stan meter", "tgl baca"}.issubset(sb.columns):
+        return None
+
+    try:
+        out = pd.DataFrame()
+        out["IDPEL"] = sb["idpel"].astype(str).str.strip()
+        out["STAND"] = pd.to_numeric(sb["stan meter"], errors="coerce")
+        out["_TGL"] = pd.to_datetime(sb["tgl baca"], dayfirst=True, errors="coerce")
+    except (ValueError, TypeError, KeyError):
+        return None
+
+    out = out.dropna(subset=["STAND", "_TGL"])
+    if out.empty:
+        return None
+
+    # Bulan rekening = bulan baca + 1 (lihat catatan siklus baca di atas)
+    out["BULAN"] = (out["_TGL"] + pd.DateOffset(months=1)).dt.strftime("%Y%m").astype(int)
+
+    # Bulan rekening yang sama, IDPEL yang sama -> ambil baca paling baru
+    out = out.sort_values(["IDPEL", "BULAN", "_TGL"])
+    out = out.groupby(["IDPEL", "BULAN"], as_index=False).tail(1)
+
+    return out[["IDPEL", "BULAN", "STAND"]].reset_index(drop=True)

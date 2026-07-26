@@ -1,100 +1,272 @@
+"""
+Photo downloader untuk SIMBA API.
+
+Pipelined parallel:
+- INFO  : POST /acmt/informasi/infopelanggan per IDPEL (return URL semua bulan)
+- DOWNLOAD : GET URL foto, simpan ke foto/{BLTH}/{IDPEL}.jpg
+
+Kedua phase berjalan BERSAMAAN: begitu info per-IDPEL selesai, URL foto-nya
+langsung di-submit ke download pool tanpa menunggu seluruh info batch kelar.
+
+Photo file is shared between runs because struktur folder per BLTH foto
+(bukan per BLTH input). Kalau file sudah ada, skip.
+"""
+
 import os
 import time
-import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    as_completed,
+    wait as wait_futures,
+    FIRST_COMPLETED,
+)
 from datetime import datetime
+
 from dateutil.relativedelta import relativedelta
 
-from config import FOTO_DIR
+from core.simba_client import SimbaAuthError, SimbaError
 
 
-def build_bulan_list(blth):
+def build_bulan_list(blth, n):
+    """Return list n BLTH ke belakang, terbaru dulu (index 0 = blth)."""
     dt = datetime.strptime(blth, "%Y%m")
-    return [(dt - relativedelta(months=i)).strftime("%Y%m") for i in range(3)]
+    return [(dt - relativedelta(months=i)).strftime("%Y%m") for i in range(n)]
+
+
+def _foto_path(foto_dir, blth, idpel):
+    return os.path.join(foto_dir, blth, f"{idpel}.jpg")
+
+
+def _all_files_present(idpel, bulan_list, foto_dir):
+    return all(
+        os.path.exists(_foto_path(foto_dir, b, idpel)) for b in bulan_list
+    )
 
 
 def download_photos(
     df,
-    session,
-    base_url,
-    foto_dir,
+    simba_client,
     blth,
-    max_workers,
+    foto_dir,
+    jumlah_bulan,
+    workers_info,
+    workers_download,
     progress_callback=None,
     stop_flag=None,
-    max_retry=3
 ):
 
-    os.makedirs(foto_dir, exist_ok=True)
-    bulan_list = build_bulan_list(blth)
+    bulan_list = build_bulan_list(blth, jumlah_bulan)
+    idpels = list(dict.fromkeys(df["IDPEL"].astype(str)))  # unique, preserve order
 
-    def task(args):
-        idpel, blth, idx = args
+    # Map idpel -> {blth_foto: filepath} untuk file yang sudah ada di disk
+    existing_map = {}
 
-        # Path format: foto/BLTH/IDPEL.jpg
-        # Cek folder sesuai periode blth masing-masing
-        target_dir = os.path.join(FOTO_DIR, blth)
-        path = os.path.join(target_dir, f"{idpel}.jpg")
+    # Pre-scan disk: kalau semua file untuk IDPEL sudah ada, skip API call
+    api_idpels = []
+    for idpel in idpels:
+        existing = {}
+        for b in bulan_list:
+            p = _foto_path(foto_dir, b, idpel)
+            if os.path.exists(p):
+                existing[b] = p
+        existing_map[idpel] = existing
+        if len(existing) != len(bulan_list):
+            api_idpels.append(idpel)
 
-        if os.path.exists(path):
-            return (idpel, idx, path)
+    # ────────────────────────────────────────────────
+    # PIPELINED: INFO + DOWNLOAD jalan bersamaan
+    # ────────────────────────────────────────────────
 
-        # Pastikan folder ada sebelum download
-        os.makedirs(target_dir, exist_ok=True)
+    info_total = len(api_idpels)
+    info_done = 0
+    info_start = time.time()
 
-        for _ in range(max_retry):
-            try:
-                r = session.get(base_url, params={
-                    "idpel": idpel,
-                    "fotoke": 1,
-                    "blth": blth
-                }, timeout=6)
+    dl_total = 0   # bertambah saat info selesai dan menemukan URL valid
+    dl_done = 0
+    dl_ok = 0
+    dl_fail = 0
+    dl_start = None  # set saat task download pertama disubmit
 
-                ct = r.headers.get("Content-Type","")
-                if "image" in ct and len(r.content) > 4000:
-                    with open(path, "wb") as f:
-                        f.write(r.content)
-                    return (idpel, idx, path)
-            except:
-                time.sleep(0.5)
+    auth_failed_info = False
+    auth_failed_dl = False
 
-        return (idpel, idx, None)
+    def fetch_info(idpel):
+        try:
+            records = simba_client.get_info_pelanggan(idpel, blth)
+        except SimbaAuthError:
+            return idpel, None, "auth"
+        except SimbaError:
+            return idpel, None, "error"
+        except Exception:
+            return idpel, None, "error"
+        return idpel, records, None
 
-    tasks = [(idpel, b, i+1)
-             for idpel in df["IDPEL"]
-             for i, b in enumerate(bulan_list)]
+    def do_download(task):
+        idpel, b, url, path = task
+        try:
+            ok = simba_client.download_foto(url, path)
+        except SimbaAuthError:
+            return idpel, b, None, "auth"
+        except Exception:
+            return idpel, b, None, "error"
+        return idpel, b, path if ok else None, None if ok else "fail"
 
-    total = len(tasks)
-    done = 0
-    start_time = time.time()
+    def emit_progress():
+        if not progress_callback:
+            return
+        elapsed_info = time.time() - info_start
+        info_rate = info_done / elapsed_info if elapsed_info > 0 else 0
+        info_remaining = (info_total - info_done) / info_rate if info_rate > 0 else 0
+
+        elapsed_dl = (time.time() - dl_start) if dl_start else 0
+        dl_rate = dl_done / elapsed_dl if elapsed_dl > 0 else 0
+        dl_remaining = (dl_total - dl_done) / dl_rate if dl_rate > 0 else 0
+
+        progress_callback({
+            "info_done": info_done,
+            "info_total": info_total,
+            "dl_done": dl_done,
+            "dl_total": dl_total,
+            "dl_ok": dl_ok,
+            "dl_fail": dl_fail,
+            "eta_info": int(info_remaining),
+            "eta_dl": int(dl_remaining),
+        })
+
+    if api_idpels:
+        # 2 pool terpisah supaya info & download tidak berebut worker slot.
+        # Connection pool di SimbaClient (size 100) cukup untuk keduanya.
+        info_pool = ThreadPoolExecutor(
+            max_workers=workers_info, thread_name_prefix="info"
+        )
+        dl_pool = ThreadPoolExecutor(
+            max_workers=workers_download, thread_name_prefix="dl"
+        )
+
+        # Single as_completed loop: gabung info + download futures.
+        # Saat info selesai → submit dl tasks ke dl_pool, masuk ke pending set.
+        # Saat dl selesai → update counter.
+        # Loop berhenti setelah info_done == info_total DAN dl_done == dl_total.
+        pending = set()
+        future_kind = {}  # future -> ('info', None) atau ('dl', None)
+
+        try:
+            for ip in api_idpels:
+                f = info_pool.submit(fetch_info, ip)
+                pending.add(f)
+                future_kind[f] = "info"
+
+            while pending:
+                if stop_flag and stop_flag():
+                    for f in pending:
+                        f.cancel()
+                    return {}, bulan_list
+
+                # FIRST_COMPLETED: blocking sampai minimal 1 future selesai.
+                # Mendukung penambahan future dinamis (download tasks) di tiap iterasi.
+                done_set, _ = wait_futures(pending, return_when=FIRST_COMPLETED)
+
+                for fut in done_set:
+                    pending.discard(fut)
+                    kind = future_kind.pop(fut, None)
+
+                    if kind == "info":
+                        if fut.cancelled():
+                            info_done += 1
+                            continue
+                        try:
+                            idpel, records, err = fut.result()
+                        except Exception:
+                            info_done += 1
+                            continue
+
+                        info_done += 1
+
+                        if err == "auth":
+                            auth_failed_info = True
+                            # Cancel sisa info yang belum jalan
+                            for p in list(pending):
+                                if future_kind.get(p) == "info":
+                                    p.cancel()
+                                    pending.discard(p)
+                                    future_kind.pop(p, None)
+                            continue
+
+                        if records is not None:
+                            rec_by_blth = {
+                                r.get("blth"): r for r in records if r.get("blth")
+                            }
+                            for b in bulan_list:
+                                rec = rec_by_blth.get(b)
+                                if not rec:
+                                    continue
+                                url = simba_client.extract_first_foto_url(rec)
+                                if not url:
+                                    continue
+                                target_path = _foto_path(foto_dir, b, idpel)
+                                if os.path.exists(target_path):
+                                    existing_map.setdefault(idpel, {})[b] = target_path
+                                    continue
+                                if dl_start is None:
+                                    dl_start = time.time()
+                                dl_total += 1
+                                dl_fut = dl_pool.submit(
+                                    do_download, (idpel, b, url, target_path)
+                                )
+                                pending.add(dl_fut)
+                                future_kind[dl_fut] = "dl"
+
+                    elif kind == "dl":
+                        if fut.cancelled():
+                            dl_done += 1
+                            dl_fail += 1
+                            continue
+                        try:
+                            idpel, b, path, err = fut.result()
+                        except Exception:
+                            dl_done += 1
+                            dl_fail += 1
+                            continue
+
+                        dl_done += 1
+                        if path:
+                            dl_ok += 1
+                            existing_map.setdefault(idpel, {})[b] = path
+                        else:
+                            dl_fail += 1
+                            if err == "auth":
+                                auth_failed_dl = True
+                                # Stop submit baru
+                                for p in list(pending):
+                                    if future_kind.get(p) == "info":
+                                        p.cancel()
+                                        pending.discard(p)
+                                        future_kind.pop(p, None)
+
+                emit_progress()
+        finally:
+            info_pool.shutdown(wait=False)
+            dl_pool.shutdown(wait=True)
+
+    if auth_failed_info:
+        raise SimbaAuthError("Token expired saat fetch infopelanggan")
+    if auth_failed_dl:
+        raise SimbaAuthError("Token expired saat download foto")
+
+    # ────────────────────────────────────────────────
+    # FORMAT OUTPUT untuk excel.py
+    # results[idpel][idx_1based] = filepath
+    # idx 1 = bulan_list[0] = BLTH terbaru
+    # ────────────────────────────────────────────────
 
     results = {}
-
-    with ThreadPoolExecutor(max_workers) as exe:
-        futures = [exe.submit(task, t) for t in tasks]
-
-        for f in as_completed(futures):
-
-            if stop_flag and stop_flag():
-                return {}, bulan_list  # cancel
-
-            idpel, idx, path = f.result()
-
-            if path:
-                results.setdefault(idpel, {})[idx] = path
-
-            done += 1
-
-            if progress_callback:
-                elapsed = time.time() - start_time
-                rate = done / elapsed if elapsed > 0 else 0
-                remaining = (total - done) / rate if rate > 0 else 0
-
-                progress_callback({
-                    "type": "photo",
-                    "done": done,
-                    "total": total,
-                    "eta": int(remaining)
-                })
+    for idpel, m in existing_map.items():
+        per_idx = {}
+        for i, b in enumerate(bulan_list, start=1):
+            p = m.get(b)
+            if p and os.path.exists(p):
+                per_idx[i] = p
+        if per_idx:
+            results[idpel] = per_idx
 
     return results, bulan_list

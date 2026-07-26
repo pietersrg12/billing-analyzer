@@ -15,13 +15,91 @@ try:
 except ImportError:
     HAS_DND = False
 
+from core.loader import read_blth
 from core.pipeline import run_pipeline
+from core import settings
 from config import THEME_DARK, THEME_LIGHT
+
+
+class CredentialsHolder:
+    """Thread-safe holder untuk passing kredensial dari UI thread ke pipeline thread."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._creds = None
+
+    def set(self, username, password):
+        with self._lock:
+            self._creds = {"username": username, "password": password}
+
+    def cancel(self):
+        with self._lock:
+            self._creds = None
+
+    def get(self):
+        with self._lock:
+            return self._creds
+
+
+class VerificationResultHolder:
+    """Thread-safe holder untuk keputusan lanjut/batal dari dialog verifikasi."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._proceed = None
+
+    def set(self, proceed):
+        with self._lock:
+            self._proceed = proceed
+
+    def get(self):
+        with self._lock:
+            return bool(self._proceed)
 
 
 STEPS = ["Load", "Prepare", "Analyze", "Download", "Export"]
 
-STEP_THRESHOLDS = [0, 10, 20, 25, 85]
+STEP_THRESHOLDS = [0, 10, 20, 22, 85]
+
+# Pengelompokan field untuk dialog Pengaturan Rule: (judul grup, [(key, label), ...])
+RULE_FIELD_GROUPS = [
+    ("Riwayat / Rata-rata", [
+        ("jumlah_bulan_rata2", "Jumlah bulan riwayat (rata-rata, sparkline, trend)"),
+    ]),
+    ("Jam Nyala", [
+        ("jam_nyala_tinggi_min", "Batas bawah Jam Tinggi (jam)"),
+        ("jam_nyala_tidak_wajar_min", "Batas Jam Tidak Wajar (jam)"),
+        ("stand_p1_jam_konstan", "Konstanta jam proyeksi STAND_P1"),
+    ]),
+    ("Kenaikan", [
+        ("kenaikan_pemakaian_min", "Pemakaian minimum (kWh)"),
+        ("kenaikan_multiplier", "Pengali RATA2"),
+        ("kenaikan_tambahan", "Tambahan tetap ke RATA2 (kWh)"),
+    ]),
+    ("Perlu Perhatian", [
+        ("perlu_perhatian_ratio_min", "Rasio minimum (x RATA2)"),
+        ("perlu_perhatian_ratio_max", "Rasio maksimum (x RATA2)"),
+        ("perlu_perhatian_pemakaian_min", "Pemakaian minimum (kWh)"),
+    ]),
+    ("Penurunan", [
+        ("penurunan_ratio_max", "Rasio maksimum (x RATA2)"),
+    ]),
+    ("Anomali Daya", [
+        ("anomali_daya_multiplier", "Pengali DAYA"),
+    ]),
+    ("Trend Naik", [
+        ("trend_min_bulan", "Minimum bulan konsisten naik"),
+        ("trend_growth_ratio", "Rasio pertumbuhan minimum"),
+    ]),
+    ("Stand Tidak Wajar", [
+        ("stand_tidak_wajar_toleransi", "Toleransi selisih stand vs pemakaian (kWh)"),
+    ]),
+    ("Indikasi Stan Baca (Meter Macet / Rumah Kosong / Cap Jam Nyala)", [
+        ("stan_baca_flat_toleransi", "Toleransi stand baca dianggap 'tidak berubah' (kWh)"),
+        ("stan_baca_flat_min_bulan", "Jumlah bulan berturut-turut untuk pola flat"),
+        ("stan_baca_placeholder_max", "Nilai stand dianggap placeholder / tidak dibaca (<=)"),
+    ]),
+]
 
 
 class App:
@@ -38,6 +116,9 @@ class App:
         self.is_dark = True
         self.current_step = -1
         self.login_event = threading.Event()
+        self.credentials_holder = CredentialsHolder()
+        self.verify_event = threading.Event()
+        self.verify_holder = VerificationResultHolder()
 
         self._build_header()
         self._build_input_section()
@@ -75,6 +156,15 @@ class App:
             width=10,
         )
         self.theme_btn.pack(side=RIGHT, padx=(5, 0))
+
+        self.rule_settings_btn = tb.Button(
+            btn_frame,
+            text="⚙ Pengaturan Rule",
+            bootstyle=(INFO, OUTLINE),
+            command=self._show_rule_settings_dialog,
+            width=18,
+        )
+        self.rule_settings_btn.pack(side=RIGHT, padx=(5, 0))
 
     def _toggle_theme(self):
         style = tb.Style()
@@ -163,6 +253,20 @@ class App:
         self.month_cb.pack(side=LEFT)
         self.month_cb.set("01")
 
+    def _autofill_blth(self, path):
+        """Baca thblrek dari file DPM, auto-fill combobox tahun & bulan."""
+        try:
+            blth = read_blth(path)
+        except Exception:
+            blth = None
+        if not blth or len(blth) != 6 or not blth.isdigit():
+            return
+        year, month = blth[:4], blth[4:]
+        if year in self.year_cb["values"]:
+            self.year_cb.set(year)
+        if month in self.month_cb["values"]:
+            self.month_cb.set(month)
+
     def _browse(self):
         path = filedialog.askopenfilename(
             filetypes=[
@@ -172,11 +276,13 @@ class App:
         )
         if path:
             self.path_var.set(path)
+            self._autofill_blth(path)
 
     def _on_drop(self, event):
         path = event.data.strip("{}")
         if os.path.isfile(path):
             self.path_var.set(path)
+            self._autofill_blth(path)
 
     # ── PROGRESS SECTION ──────────────────────────────────
 
@@ -403,6 +509,10 @@ class App:
         blth = year + month
         self.stop = False
         self.login_event.clear()
+        self.credentials_holder.cancel()
+        self.verify_event.clear()
+        self.verify_holder.set(None)
+        self._error_occurred = False
         self._set_running(True)
         self._reset_steps()
         self.progress_bar["value"] = 0
@@ -423,12 +533,378 @@ class App:
                 progress_callback=self.queue.put,
                 stop_flag=lambda: self.stop,
                 login_event=self.login_event,
+                credentials_holder=self.credentials_holder,
+                verify_event=self.verify_event,
+                verify_holder=self.verify_holder,
             )
         except Exception as e:
             self.queue.put(("log", f"ERROR: {e}"))
             self.queue.put(("error", str(e)))
 
         self.queue.put(("done", None))
+
+    # ── RULE SETTINGS DIALOG ──────────────────────────────
+
+    def _show_rule_settings_dialog(self):
+        """Dialog untuk mengubah threshold rule anomali. Simpan/Reset/Batal."""
+
+        current = settings.load_rules()
+
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Pengaturan Rule Deteksi Anomali")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.geometry("480x560")
+
+        tb.Label(
+            dialog,
+            text="Pengaturan Rule Deteksi Anomali",
+            font=("Segoe UI", 13, "bold"),
+            bootstyle=PRIMARY,
+        ).pack(anchor=W, padx=15, pady=(15, 10))
+
+        body = tb.Frame(dialog, padding=(15, 0, 5, 0))
+        body.pack(fill=BOTH, expand=True)
+
+        canvas = tk.Canvas(body, highlightthickness=0)
+        scrollbar = tb.Scrollbar(body, orient=VERTICAL, command=canvas.yview)
+        scroll_frame = tb.Frame(canvas)
+
+        scroll_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
+        )
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=LEFT, fill=BOTH, expand=True)
+        scrollbar.pack(side=RIGHT, fill=Y)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        field_vars = {}
+        row = 0
+        for group_title, fields in RULE_FIELD_GROUPS:
+            tb.Label(
+                scroll_frame,
+                text=group_title,
+                font=("Segoe UI", 10, "bold"),
+                bootstyle=INFO,
+            ).grid(row=row, column=0, columnspan=2, sticky=W, pady=(10, 2), padx=(0, 10))
+            row += 1
+            for key, label in fields:
+                tb.Label(scroll_frame, text=label, font=("Segoe UI", 9)).grid(
+                    row=row, column=0, sticky=W, padx=(10, 8), pady=2
+                )
+                var = tk.StringVar(value=str(current.get(key, settings.DEFAULT_RULES[key])))
+                entry = tb.Entry(scroll_frame, textvariable=var, width=10, font=("Segoe UI", 9))
+                entry.grid(row=row, column=1, sticky=W, pady=2, padx=(0, 15))
+                field_vars[key] = var
+                row += 1
+
+        btn_frame = tb.Frame(dialog, padding=(15, 10, 15, 15))
+        btn_frame.pack(fill=X)
+
+        def _reset():
+            for key, var in field_vars.items():
+                var.set(str(settings.DEFAULT_RULES[key]))
+
+        def _save():
+            new_rules = {}
+            try:
+                for key, var in field_vars.items():
+                    raw = var.get().strip()
+                    if isinstance(settings.DEFAULT_RULES[key], int):
+                        new_rules[key] = int(float(raw))
+                    else:
+                        new_rules[key] = float(raw)
+            except ValueError:
+                messagebox.showerror(
+                    "Input tidak valid",
+                    "Semua nilai harus berupa angka.",
+                    parent=dialog,
+                )
+                return
+            settings.save_rules(new_rules)
+            messagebox.showinfo("Tersimpan", "Pengaturan rule disimpan.", parent=dialog)
+            canvas.unbind_all("<MouseWheel>")
+            dialog.destroy()
+
+        def _cancel():
+            canvas.unbind_all("<MouseWheel>")
+            dialog.destroy()
+
+        tb.Button(
+            btn_frame, text="Reset ke Default", command=_reset, bootstyle=WARNING, width=16
+        ).pack(side=LEFT)
+        tb.Button(
+            btn_frame, text="Batal", command=_cancel, bootstyle=SECONDARY, width=10
+        ).pack(side=RIGHT, padx=(8, 0))
+        tb.Button(
+            btn_frame, text="Simpan", command=_save, bootstyle=SUCCESS, width=10
+        ).pack(side=RIGHT)
+
+        dialog.protocol("WM_DELETE_WINDOW", _cancel)
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        dialog.wait_window()
+
+    # ── VERIFIKASI DATABASE DIALOG ────────────────────────
+
+    def _show_verification_dialog(self, payload):
+        """Dialog ringkasan coverage database. Blocking sampai user Lanjut/Batal."""
+
+        n_bulan = payload.get("n_bulan", 6)
+
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Verifikasi Database")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frm = tb.Frame(dialog, padding=20)
+        frm.pack(fill=BOTH, expand=True)
+
+        tb.Label(
+            frm,
+            text="Verifikasi Coverage Database",
+            font=("Segoe UI", 13, "bold"),
+            bootstyle=PRIMARY,
+        ).pack(anchor=W, pady=(0, 4))
+
+        tb.Label(
+            frm,
+            text=f"Mengecek apakah database sudah terisi {n_bulan} bulan terakhir "
+                 f"(sesuai Pengaturan Rule).",
+            font=("Segoe UI", 9),
+            bootstyle=SECONDARY,
+            wraplength=420,
+        ).pack(anchor=W, pady=(0, 12))
+
+        def _render_db_summary(title, cov):
+            box = tb.LabelFrame(frm, text=f"  {title}  ")
+            box.pack(fill=X, pady=(0, 10))
+            inner = tb.Frame(box, padding=8)
+            inner.pack(fill=X)
+
+            if cov is None:
+                tb.Label(inner, text="Fitur ini tidak diaktifkan.", bootstyle=SECONDARY).pack(
+                    anchor=W
+                )
+                return
+
+            if not cov.get("available"):
+                tb.Label(
+                    inner,
+                    text="Database tidak ditemukan / kosong.",
+                    bootstyle=DANGER,
+                ).pack(anchor=W)
+                return
+
+            missing = cov.get("missing_bulan") or []
+            if missing:
+                tb.Label(
+                    inner,
+                    text=f"⚠ Bulan belum ada datanya (db-wide): {', '.join(missing)}",
+                    font=("Segoe UI", 9, "bold"),
+                    bootstyle=DANGER,
+                    wraplength=400,
+                ).pack(anchor=W)
+            else:
+                tb.Label(
+                    inner,
+                    text="Semua bulan yang diharapkan sudah ada datanya.",
+                    bootstyle=SUCCESS,
+                ).pack(anchor=W)
+
+            n_checked = cov.get("n_idpel_checked", 0)
+            n_incomplete = cov.get("n_idpel_incomplete", 0)
+            n_efektif = cov.get("n_bulan_efektif", n_bulan)
+            style = SUCCESS if n_incomplete == 0 else WARNING
+            tb.Label(
+                inner,
+                text=f"{n_incomplete} dari {n_checked} pelanggan riwayatnya belum "
+                     f"lengkap {n_efektif} bulan yang tersedia di database.",
+                bootstyle=style,
+            ).pack(anchor=W, pady=(4, 0))
+
+            sample = cov.get("sample_incomplete") or []
+            if sample:
+                sample_txt = ", ".join(f"{idpel} ({n}bln)" for idpel, n in sample[:10])
+                tb.Label(
+                    inner,
+                    text=f"Contoh: {sample_txt}",
+                    font=("Segoe UI", 8, "italic"),
+                    bootstyle=SECONDARY,
+                    wraplength=400,
+                ).pack(anchor=W, pady=(2, 0))
+
+        _render_db_summary("Database Rekening", payload.get("rekening"))
+        _render_db_summary("Database Stan Baca", payload.get("stanbaca"))
+
+        has_missing = any(
+            (cov or {}).get("missing_bulan")
+            for cov in (payload.get("rekening"), payload.get("stanbaca"))
+        )
+
+        ack_var = tb.BooleanVar(value=False)
+        if has_missing:
+            tb.Checkbutton(
+                frm,
+                text="Saya paham database belum lengkap dan tetap ingin melanjutkan"
+                     " (hasil analisis bisa keliru untuk bulan yang hilang).",
+                variable=ack_var,
+                bootstyle="danger",
+                command=lambda: proceed_btn.config(
+                    state=NORMAL if ack_var.get() else DISABLED
+                ),
+            ).pack(anchor=W, pady=(4, 0), fill=X)
+
+        btn_frame = tb.Frame(frm)
+        btn_frame.pack(fill=X, pady=(8, 0))
+
+        def _proceed():
+            self.verify_holder.set(True)
+            dialog.destroy()
+
+        def _cancel():
+            self.verify_holder.set(False)
+            self.stop = True
+            dialog.destroy()
+
+        proceed_btn = tb.Button(
+            btn_frame, text="Lanjut", command=_proceed, bootstyle=SUCCESS, width=12
+        )
+        proceed_btn.pack(side=RIGHT, padx=(8, 0))
+        if has_missing:
+            proceed_btn.config(state=DISABLED)
+        tb.Button(
+            btn_frame, text="Batal", command=_cancel, bootstyle=SECONDARY, width=12
+        ).pack(side=RIGHT)
+
+        dialog.protocol("WM_DELETE_WINDOW", _cancel)
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        dialog.wait_window()
+
+        self.verify_event.set()
+
+    # ── SIMBA LOGIN DIALOG ────────────────────────────────
+
+    def _show_simba_login_dialog(self):
+        """Modal dialog untuk input kredensial SIMBA. Blocking sampai user submit/cancel."""
+
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Login SIMBA")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frm = tb.Frame(dialog, padding=20)
+        frm.pack(fill=BOTH, expand=True)
+
+        tb.Label(
+            frm,
+            text="Login SIMBA",
+            font=("Segoe UI", 14, "bold"),
+            bootstyle=PRIMARY,
+        ).grid(row=0, column=0, columnspan=2, sticky=W, pady=(0, 4))
+
+        tb.Label(
+            frm,
+            text="Masukkan kredensial SIMBA Anda untuk mengambil data foto meter.",
+            font=("Segoe UI", 9),
+            bootstyle=SECONDARY,
+            wraplength=320,
+        ).grid(row=1, column=0, columnspan=2, sticky=W, pady=(0, 12))
+
+        tb.Label(frm, text="Username:", font=("Segoe UI", 10)).grid(
+            row=2, column=0, sticky=W, pady=4
+        )
+        username_var = tk.StringVar()
+        user_entry = tb.Entry(
+            frm, textvariable=username_var, font=("Segoe UI", 10), width=28
+        )
+        user_entry.grid(row=2, column=1, sticky=EW, pady=4, padx=(8, 0))
+
+        tb.Label(frm, text="Password:", font=("Segoe UI", 10)).grid(
+            row=3, column=0, sticky=W, pady=4
+        )
+        password_var = tk.StringVar()
+        pass_entry = tb.Entry(
+            frm,
+            textvariable=password_var,
+            font=("Segoe UI", 10),
+            width=28,
+            show="•",
+        )
+        pass_entry.grid(row=3, column=1, sticky=EW, pady=4, padx=(8, 0))
+
+        hint = tb.Label(
+            frm,
+            text="Format: 12345.namauser (5 digit unitup + nama)",
+            font=("Segoe UI", 8, "italic"),
+            bootstyle=SECONDARY,
+        )
+        hint.grid(row=4, column=0, columnspan=2, sticky=W, pady=(2, 12))
+
+        btn_frame = tb.Frame(frm)
+        btn_frame.grid(row=5, column=0, columnspan=2, sticky=EW)
+
+        result = {"submitted": False}
+
+        def submit():
+            u = username_var.get().strip()
+            p = password_var.get()
+            if not u or not p:
+                messagebox.showwarning(
+                    "Peringatan",
+                    "Username dan password tidak boleh kosong.",
+                    parent=dialog,
+                )
+                return
+            self.credentials_holder.set(u, p)
+            result["submitted"] = True
+            dialog.destroy()
+
+        def cancel():
+            self.credentials_holder.cancel()
+            self.stop = True
+            dialog.destroy()
+
+        tb.Button(
+            btn_frame, text="Login", command=submit, bootstyle=SUCCESS, width=12
+        ).pack(side=RIGHT, padx=(8, 0))
+        tb.Button(
+            btn_frame, text="Cancel", command=cancel, bootstyle=SECONDARY, width=12
+        ).pack(side=RIGHT)
+
+        dialog.bind("<Return>", lambda e: submit())
+        dialog.bind("<Escape>", lambda e: cancel())
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+
+        # Center dialog on root
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        user_entry.focus_set()
+        dialog.wait_window()
+
+        # Lepas pipeline thread
+        self.login_event.set()
 
     # ── QUEUE PROCESSING ──────────────────────────────────
 
@@ -459,30 +935,33 @@ class App:
                     else:
                         self.eta_label.config(text=f"ETA: {data}")
 
-                elif kind == "login_wait":
-                    self.status_label.config(text="Menunggu login...", bootstyle=WARNING)
-                    messagebox.showinfo(
-                        "Login Diperlukan",
-                        "Browser Chrome telah dibuka.\n\n"
-                        "1. Login ke portal PLN\n"
-                        "2. Selesaikan captcha\n"
-                        "3. Klik OK setelah selesai login",
-                    )
-                    self.login_event.set()
+                elif kind == "simba_login_required":
+                    self.status_label.config(text="Menunggu login SIMBA...", bootstyle=WARNING)
+                    self._show_simba_login_dialog()
+
+                elif kind == "verification_required":
+                    self.status_label.config(text="Menunggu verifikasi database...", bootstyle=WARNING)
+                    self._show_verification_dialog(data)
 
                 elif kind == "error":
                     if self.current_step >= 0:
                         self._set_step_state(self.current_step, "error")
+                    self._error_occurred = True
 
                 elif kind == "done":
                     self._set_running(False)
-                    self.progress_bar["value"] = 100
-                    self.percent_label.config(text="100%")
-                    self.status_label.config(text="Selesai ✓", bootstyle=SUCCESS)
-                    self.eta_label.config(text="")
-                    for i in range(len(STEPS)):
-                        self._set_step_state(i, "done")
-                    messagebox.showinfo("Selesai", "Proses analisa selesai!")
+                    if getattr(self, "_error_occurred", False):
+                        self.status_label.config(text="Selesai dengan error", bootstyle=DANGER)
+                        self.eta_label.config(text="")
+                        self._error_occurred = False
+                    else:
+                        self.progress_bar["value"] = 100
+                        self.percent_label.config(text="100%")
+                        self.status_label.config(text="Selesai ✓", bootstyle=SUCCESS)
+                        self.eta_label.config(text="")
+                        for i in range(len(STEPS)):
+                            self._set_step_state(i, "done")
+                        messagebox.showinfo("Selesai", "Proses analisa selesai!")
 
         except queue.Empty:
             pass
