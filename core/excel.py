@@ -4,6 +4,7 @@ from openpyxl.drawing.image import Image
 from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.formatting.rule import FormulaRule
 
 from core.koreksi import (
     ALASAN_MAP,
@@ -14,6 +15,7 @@ from core.koreksi import (
     PILIHAN_RATA2,
     PILIHAN_RUMAH_KOSONG,
     PILIHAN_SALAH_ENTRY,
+    PILIHAN_SALAH_FOTO,
     PILIHAN_SALAH_PDL,
 )
 
@@ -52,19 +54,10 @@ def font_perubahan(val):
     return None
 
 
-# Urutan prioritas kemunculan di sheet INDIKASI_STAN_BACA (paling mendesak duluan)
-INDIKASI_PRIORITAS = [
-    "Kemungkinan Meter Macet",
-    "Stan Baca Tidak Pernah Dibaca",
-    "Riwayat Sering Kena Batas Jam Nyala",
-    "Kemungkinan Rumah Kosong",
-]
-
-
 # Blok kolom untuk pewarnaan visual (header + tint data), supaya pemeriksa
 # langsung tahu sumber datanya: rekening billing vs baca meter fisik.
 BLOK_REKENING = ("STAND_LALU", "STAND_KINI", "PEMAKAIAN_BULAN_LALU", "PEMAKAIAN")
-BLOK_STAN_BACA = ("STAND_BACA_LALU", "PEMAKAIAN_ASLI", "SELISIH_STAN_BACA", "INDIKASI_STAN_BACA")
+BLOK_STAN_BACA = ("STAND_BACA_LALU", "PEMAKAIAN_ASLI", "SELISIH_STAN_BACA")
 BLOK_RATA2 = ("RATA2",)
 
 
@@ -75,7 +68,7 @@ def _build_sheet_data(source, bulan_list, include_status=False, include_koreksi=
     -> (STATUS utk sheet campuran) -> foto -> proyeksi stand.
     DETAIL digabung ke KELAINAN. STATUS hanya diikutkan untuk sheet campuran
     (PRIORITAS_KELAINAN, BUKAN_KWH) - di sheet per-status sudah tercermin
-    dari nama sheet. KETERANGAN_STAN_BACA tidak diekspor (label INDIKASI cukup).
+    dari nama sheet.
     """
     data_out = source[[
         "IDPEL", "TARIF", "DAYA",
@@ -165,6 +158,29 @@ def export_excel(df, output_file, bulan_list, klasifikasi=None, ocr_results=None
             ws.add_data_validation(dv)
             dv.add(f"{pil_letter}2:{pil_letter}{len(data_out) + 1}")
 
+            # Pengingat visual: highlight sel yang WAJIB diisi user selama
+            # masih kosong, supaya tidak lupa - hilang otomatis begitu diisi.
+            # MANUAL -> KWH_MANUAL wajib; SALAH ENTRY -> STAN_MANUAL wajib.
+            last_row = len(data_out) + 1
+            # NOTE: fill utk conditional formatting (dxf) WAJIB set start_color
+            # DAN end_color sama-sama - beda dari fill cell biasa yang cukup
+            # start_color saja. Kalau cuma start_color, Excel diam-diam tidak
+            # merender fill-nya sama sekali (dxf fgColor tanpa bgColor).
+            ws.conditional_formatting.add(
+                f"{kwh_letter}2:{kwh_letter}{last_row}",
+                FormulaRule(
+                    formula=[f'AND(${pil_letter}2="{PILIHAN_MANUAL}",${kwh_letter}2="")'],
+                    fill=PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid"),
+                ),
+            )
+            ws.conditional_formatting.add(
+                f"{stanm_letter}2:{stanm_letter}{last_row}",
+                FormulaRule(
+                    formula=[f'AND(${pil_letter}2="{PILIHAN_SALAH_ENTRY}",${stanm_letter}2="")'],
+                    fill=PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid"),
+                ),
+            )
+
             for i, (_, r) in enumerate(data_out.iterrows()):
                 koreksi_rows.append({
                     "IDPEL": r["IDPEL"], "STATUS": status,
@@ -251,12 +267,12 @@ def export_excel(df, output_file, bulan_list, klasifikasi=None, ocr_results=None
             ws_kor.cell(row=r, column=8).value = (
                 f"=IF('{sn}'!{m['_stanm']}{m['_row']}=\"\",\"\",'{sn}'!{m['_stanm']}{m['_row']})"
             )
-            # STAN BARU: RATA2/CAP-720/RUMAH KOSONG pakai kolom proyeksi;
-            # MANUAL = STAND_LALU + KWH_MANUAL; SALAH ENTRY = STAN_MANUAL
-            # langsung (wajib diisi, tidak ada fallback); SALAH PDL/BELUM PDL
-            # = STAN_MANUAL kalau diisi, else fallback STAND_RATA2.
+            # STAN BARU: RATA2/SALAH FOTO/CAP-720/RUMAH KOSONG pakai kolom
+            # proyeksi; MANUAL = STAND_LALU + KWH_MANUAL; SALAH ENTRY =
+            # STAN_MANUAL langsung (wajib diisi, tidak ada fallback); SALAH
+            # PDL/BELUM PDL = STAN_MANUAL kalau diisi, else fallback STAND_RATA2.
             ws_kor.cell(row=r, column=12).value = (
-                f'=IF(F{r}="{PILIHAN_RATA2}",I{r},'
+                f'=IF(OR(F{r}="{PILIHAN_RATA2}",F{r}="{PILIHAN_SALAH_FOTO}"),I{r},'
                 f'IF(F{r}="{PILIHAN_CAP720}",J{r},'
                 f'IF(F{r}="{PILIHAN_RUMAH_KOSONG}",K{r},'
                 f'IF(F{r}="{PILIHAN_MANUAL}",C{r}+N(G{r}),'
@@ -270,8 +286,9 @@ def export_excel(df, output_file, bulan_list, klasifikasi=None, ocr_results=None
                 f'IF(F{r}="{PILIHAN_RUMAH_KOSONG}","{ALASAN_MAP[PILIHAN_RUMAH_KOSONG]}",'
                 f'IF(F{r}="{PILIHAN_MANUAL}","{ALASAN_MAP[PILIHAN_MANUAL]}",'
                 f'IF(F{r}="{PILIHAN_SALAH_ENTRY}","{ALASAN_MAP[PILIHAN_SALAH_ENTRY]}",'
+                f'IF(F{r}="{PILIHAN_SALAH_FOTO}","{ALASAN_MAP[PILIHAN_SALAH_FOTO]}",'
                 f'IF(F{r}="{PILIHAN_SALAH_PDL}","{ALASAN_MAP[PILIHAN_SALAH_PDL]}",'
-                f'IF(F{r}="{PILIHAN_BELUM_PDL}","{ALASAN_MAP[PILIHAN_BELUM_PDL]}","")))))))'
+                f'IF(F{r}="{PILIHAN_BELUM_PDL}","{ALASAN_MAP[PILIHAN_BELUM_PDL]}",""))))))))'
             )
 
         sheet_map["KOREKSI_STAND"] = df_kor
@@ -311,17 +328,6 @@ def export_excel(df, output_file, bulan_list, klasifikasi=None, ocr_results=None
         ]:
             pct = round(count / n_total_klasif * 100, 1) if n_total_klasif > 0 else 0
             summary_data.append([label, count, pct])
-
-    if "INDIKASI_STAN_BACA" in df.columns:
-        ind_counts = df[df["INDIKASI_STAN_BACA"] != ""]["INDIKASI_STAN_BACA"].value_counts()
-        if not ind_counts.empty:
-            summary_data.append([""])
-            summary_data.append(["INDIKASI STAN BACA (kolom INDIKASI di tiap sheet)"])
-            summary_data.append(["INDIKASI", "JUMLAH"])
-            for label in INDIKASI_PRIORITAS:
-                cnt = ind_counts.get(label, 0)
-                if cnt:
-                    summary_data.append([label, cnt])
 
     summary_data.append([""])
     summary_data.append(["Top 10 Jam Nyala Tertinggi:"])
@@ -380,12 +386,6 @@ def format_excel(output_file, sheet_map, results, bulan_list, ocr_results=None, 
         "Penurunan": PatternFill(start_color="CCCCFF", fill_type="solid"),
     }
 
-    warna_indikasi = {
-        "Kemungkinan Meter Macet": PatternFill(start_color="FFC7CE", fill_type="solid"),
-        "Stan Baca Tidak Pernah Dibaca": PatternFill(start_color="E4DFEC", fill_type="solid"),
-        "Kemungkinan Rumah Kosong": PatternFill(start_color="FFEB9C", fill_type="solid"),
-        "Riwayat Sering Kena Batas Jam Nyala": PatternFill(start_color="BDD7EE", fill_type="solid"),
-    }
 
     # Blok kolom berwarna: header lebih gelap + tint tipis di data,
     # supaya pemeriksa langsung tahu sumber data tiap kolom.
@@ -444,7 +444,6 @@ def format_excel(output_file, sheet_map, results, bulan_list, ocr_results=None, 
         jam_col = None
         spark_col = None
         selisih_stanbaca_col = None
-        indikasi_col = None
         blok_col_fills = {}   # col_idx -> tint fill (untuk data cells)
         for col in range(1, ws.max_column+1):
             val = ws.cell(row=1, column=col).value
@@ -460,8 +459,6 @@ def format_excel(output_file, sheet_map, results, bulan_list, ocr_results=None, 
                 spark_col = col
             if val == "SELISIH_STAN_BACA":
                 selisih_stanbaca_col = col
-            if val == "INDIKASI_STAN_BACA":
-                indikasi_col = col
             for blok_name, blok in blok_style.items():
                 if blok_name == "koreksi" and sheet_name == "KOREKSI_STAND":
                     continue
@@ -572,14 +569,6 @@ def format_excel(output_file, sheet_map, results, bulan_list, ocr_results=None, 
                 if sel_val is not None and sel_val > stan_baca_toleransi:
                     sel_cell.fill = PatternFill(start_color="FFD966", fill_type="solid")
                     sel_cell.font = Font(bold=True)
-
-            # INDIKASI STAN BACA warna sesuai kategori
-            if indikasi_col:
-                ind_cell = ws.cell(row=row_idx, column=indikasi_col)
-                fill = warna_indikasi.get(ind_cell.value)
-                if fill:
-                    ind_cell.fill = fill
-                    ind_cell.font = Font(bold=True)
 
             # BORDER + ALIGN
             for col in range(1, ws.max_column+1):

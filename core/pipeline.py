@@ -29,7 +29,6 @@ from core import settings, verification
 from core.analyzer import (
     apply_analysis,
     compute_stanbaca_comparison,
-    compute_stanbaca_indikasi,
     prepare,
 )
 from core.classifier import classify_all, is_available as classifier_available
@@ -183,7 +182,6 @@ def run_pipeline(
 
     if stanbaca_db is not None:
         df = compute_stanbaca_comparison(df, stanbaca_db, blth, cfg)
-        df = compute_stanbaca_indikasi(df, stanbaca_db, db, blth, cfg)
 
     percent(20)
 

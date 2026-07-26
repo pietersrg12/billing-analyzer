@@ -15,6 +15,9 @@ adalah STAND_KINI, dengan 4 opsi pengganti:
                  -> untuk penyesuaian kurang tagih bertahap.
 - SALAH ENTRY  : STAN_MANUAL langsung jadi stand baru (bukan ditambah ke
                  STAND_LALU) -> untuk typo/salah input angka stand.
+- SALAH FOTO   : STAND_LALU + rata-rata pemakaian (kolom STAND_RATA2),
+                 sama seperti RATA2 -> untuk foto yang salah/tidak sesuai
+                 sehingga stand tidak bisa diverifikasi dari foto.
 - SALAH PDL    : STAN_MANUAL kalau diisi, else fallback ke STAND_RATA2
                  -> data pelanggan salah, stand perlu dikoreksi manual.
 - BELUM PDL    : sama seperti SALAH PDL (STAN_MANUAL atau fallback RATA2)
@@ -43,27 +46,28 @@ KELAINAN_TAK_TERBACA_KEYWORDS = (
     "ANJING", "STAN DARI PELANGGAN",
 )
 
-INDIKASI_TAK_PERNAH_DIBACA = "Stan Baca Tidak Pernah Dibaca"
-
 PILIHAN_BIARKAN = "BIARKAN"
 PILIHAN_RATA2 = "RATA2"
 PILIHAN_CAP720 = "CAP-720"
 PILIHAN_RUMAH_KOSONG = "RUMAH KOSONG"
 PILIHAN_MANUAL = "MANUAL"
 PILIHAN_SALAH_ENTRY = "SALAH ENTRY"
+PILIHAN_SALAH_FOTO = "SALAH FOTO"
 PILIHAN_SALAH_PDL = "SALAH PDL"
 PILIHAN_BELUM_PDL = "BELUM PDL"
 
-PILIHAN_OPTIONS = [
+# Urut A-Z biar enak dibaca di dropdown Excel.
+PILIHAN_OPTIONS = sorted([
     PILIHAN_BIARKAN,
     PILIHAN_RATA2,
     PILIHAN_CAP720,
     PILIHAN_RUMAH_KOSONG,
     PILIHAN_MANUAL,
     PILIHAN_SALAH_ENTRY,
+    PILIHAN_SALAH_FOTO,
     PILIHAN_SALAH_PDL,
     PILIHAN_BELUM_PDL,
-]
+])
 
 # Opsi yang butuh isian STAN_MANUAL (stand baru langsung, bukan kWh) di
 # sheet status - dipakai excel.py utk tahu kolom mana yang perlu formula
@@ -79,6 +83,7 @@ ALASAN_MAP = {
     PILIHAN_RUMAH_KOSONG: "RUMAH KOSONG - STAND TETAP (PEMAKAIAN 0)",
     PILIHAN_MANUAL: "PENYESUAIAN KURANG TAGIH BERTAHAP",
     PILIHAN_SALAH_ENTRY: "SALAH ENTRY - STAND DIGANTI SESUAI STAN MANUAL",
+    PILIHAN_SALAH_FOTO: "SALAH FOTO - STAND DIGANTI STAND LALU + RATA-RATA",
     PILIHAN_SALAH_PDL: "SALAH PDL - PERLU KOREKSI DATA PELANGGAN",
     PILIHAN_BELUM_PDL: "BELUM PDL - PERLU PROSES PDL",
 }
@@ -113,19 +118,10 @@ def tambah_saran_koreksi(df, cfg, klasifikasi=None):
     for kw in KELAINAN_TAK_TERBACA_KEYWORDS:
         kel_tak_terbaca |= kelainan.str.contains(kw, regex=False)
 
-    indikasi = (
-        df["INDIKASI_STAN_BACA"].fillna("")
-        if "INDIKASI_STAN_BACA" in df.columns
-        else pd.Series("", index=df.index)
-    )
     foto_bukan_kwh = df["IDPEL"].astype(str).map(
         lambda x: klasifikasi.get(x) == "bukan_kwh"
     )
-    is_tak_terbaca = (
-        kel_tak_terbaca
-        | (indikasi == INDIKASI_TAK_PERNAH_DIBACA)
-        | foto_bukan_kwh
-    )
+    is_tak_terbaca = kel_tak_terbaca | foto_bukan_kwh
 
     df.loc[is_stand_minus, "PILIHAN"] = PILIHAN_RUMAH_KOSONG
     df.loc[is_stand_minus & is_tak_terbaca, "PILIHAN"] = PILIHAN_RATA2
