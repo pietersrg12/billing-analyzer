@@ -202,13 +202,13 @@ class BillingClient:
     # Endpoint list dipakai untuk mengambil totalItems sebelum export: payload
     # export menuntut `size` eksplisit, dan menebak angka besar berisiko ditolak
     # server sekaligus menyembunyikan kalau ternyata datanya lebih banyak.
-    # BELUM terverifikasi dari capture (yang tertangkap hanya export-nya).
-    # Kalau path ini salah, hitung_total() balas None dan download_billing_detail
-    # memakai `size` cadangan dari pemanggil - jadi salah tebak di sini tidak
-    # menggagalkan unduhan, cuma kehilangan angka pastinya.
     URL_LIST_BILLING = "/api/monitoring/billing/monitoring-billing-detil"
     URL_LIST_DLPD = "/api/monitoring/billing/monitoring-billing-dlpd-detil"
     URL_LIST_DPM = "/api/monitoring-dpm-detil"
+
+    # Payload list = payload export dikurangi kunci-kunci ini (dibandingkan
+    # langsung dari capture ketiga pasangan endpoint).
+    KUNCI_KHUSUS_EXPORT = ("tipe", "dlpdKvarh")
 
     URL_EXPORT_BILLING = "/api/monitoring/billing/monitoring-billing-detail-export"
     URL_EXPORT_DLPD = "/api/monitoring/billing/monitoring-dlpd-detail-export"
@@ -245,6 +245,10 @@ class BillingClient:
         payload = dict(payload)
         payload["page"] = 0
         payload["size"] = 1
+        # Kunci khusus export dibuang: browser tidak pernah mengirimnya ke
+        # endpoint list, dan sebagian backend menolak field asing.
+        for k in self.KUNCI_KHUSUS_EXPORT:
+            payload.pop(k, None)
 
         try:
             resp = self.session.post(
