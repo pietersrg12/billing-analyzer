@@ -61,43 +61,61 @@ STEPS = ["Load", "Prepare", "Analyze", "Download", "Export"]
 
 STEP_THRESHOLDS = [0, 10, 20, 22, 85]
 
-# Pengelompokan field untuk dialog Pengaturan Rule: (judul grup, [(key, label), ...])
+# Field yang diisi dalam PERSEN - dapat sufiks "%" di kanan kotak isian.
+FIELD_PERSEN = {"kenaikan_persen_min", "penurunan_persen_min", "trend_persen_min"}
+
+# Pengelompokan field untuk dialog Pengaturan Rule:
+#   (judul grup, kalimat penjelas, [(key, label), ...])
+#
+# Label ditulis sebagai kalimat utuh bersatuan, bukan istilah teknis - dialog
+# ini dipakai orang yang tidak membaca kode. Sengaja memakai kata "median"
+# (bukan "rata-rata") karena core/analyzer.py memang menghitung median; nama
+# kolom Excel RATA2 dibiarkan apa adanya supaya file hasil tidak berubah.
+# Jumlah bulan tidak ditulis di label ("median riwayat", bukan "median 6
+# bulan") karena mengikuti jumlah_bulan_rata2 yang bisa diubah user.
 RULE_FIELD_GROUPS = [
-    ("Riwayat / Rata-rata", [
-        ("jumlah_bulan_rata2", "Jumlah bulan riwayat (rata-rata, sparkline, trend)"),
+    ("Riwayat Pemakaian",
+     "Jendela riwayat yang jadi dasar semua perbandingan di bawah. Nilai "
+     "pembanding memakai MEDIAN, bukan rata-rata, supaya satu bulan ekstrem "
+     "tidak menggeser patokan.", [
+        ("jumlah_bulan_rata2", "Jumlah bulan riwayat yang dipakai (bulan)"),
     ]),
-    ("Jam Nyala", [
-        ("jam_nyala_tinggi_min", "Batas bawah Jam Tinggi (jam)"),
-        ("jam_nyala_tidak_wajar_min", "Batas Jam Tidak Wajar (jam)"),
-        ("stand_p1_jam_konstan", "Konstanta jam proyeksi STAND_P1"),
+    ("Kenaikan",
+     "Ditandai \"Kenaikan\" bila pemakaian bulan ini melewati KEDUA batas di "
+     "bawah. Batas pemakaian minimum menyaring pelanggan kecil, karena naik "
+     "50% dari 40 kWh cuma +20 kWh dan itu bukan anomali.", [
+        ("kenaikan_pemakaian_min", "Pemakaian minimum agar ikut dicek (kWh)"),
+        ("kenaikan_persen_min", "Selisih pemakaian minimal di atas median"),
     ]),
-    ("Kenaikan", [
-        ("kenaikan_pemakaian_min", "Pemakaian minimum (kWh)"),
-        ("kenaikan_multiplier", "Pengali RATA2"),
-        ("kenaikan_tambahan", "Tambahan tetap ke RATA2 (kWh)"),
+    ("Penurunan",
+     "Ditandai \"Penurunan\" bila pemakaian turun sebanyak batas ini tapi "
+     "tidak nol - pemakaian nol ditangani rule Meter Macet.", [
+        ("penurunan_persen_min", "Selisih pemakaian minimal di bawah median"),
     ]),
-    ("Perlu Perhatian", [
-        ("perlu_perhatian_ratio_min", "Rasio minimum (x RATA2)"),
-        ("perlu_perhatian_ratio_max", "Rasio maksimum (x RATA2)"),
-        ("perlu_perhatian_pemakaian_min", "Pemakaian minimum (kWh)"),
+    ("Jam Nyala (sheet >720JN)",
+     "Jam nyala = pemakaian (kWh) dibagi daya (kW). 720 jam setara sebulan "
+     "penuh nonstop, jadi di atasnya berarti pemakaian melampaui kemampuan "
+     "fisik daya terpasang. Konstanta CAP-720 sengaja sedikit di bawah batas "
+     "supaya stand hasil koreksi tidak lagi melewatinya.", [
+        ("jam_nyala_tinggi_min", "Masuk sheet >720JN bila jam nyala minimal (jam)"),
+        ("stand_p1_jam_konstan", "Jam yang dipakai usulan koreksi CAP-720 (jam)"),
     ]),
-    ("Penurunan", [
-        ("penurunan_ratio_max", "Rasio maksimum (x RATA2)"),
+    ("Trend Naik",
+     "Ditandai bila pemakaian naik terus TANPA TERPUTUS sepanjang riwayat, "
+     "dan totalnya tumbuh melewati batas di bawah.", [
+        ("trend_min_bulan", "Minimal jumlah bulan data tersedia (bulan)"),
+        ("trend_persen_min", "Selisih pemakaian bulan terakhir vs bulan pertama"),
     ]),
-    ("Anomali Daya", [
-        ("anomali_daya_multiplier", "Pengali DAYA"),
+    ("Stand Tidak Wajar",
+     "Selisih stand (stand kini - stand lalu) seharusnya persis sama dengan "
+     "pemakaian yang ditagih. Ditandai bila bedanya melewati toleransi ini.", [
+        ("stand_tidak_wajar_toleransi", "Toleransi beda selisih stand vs pemakaian (kWh)"),
     ]),
-    ("Trend Naik", [
-        ("trend_min_bulan", "Minimum bulan konsisten naik"),
-        ("trend_growth_ratio", "Rasio pertumbuhan minimum"),
-    ]),
-    ("Stand Tidak Wajar", [
-        ("stand_tidak_wajar_toleransi", "Toleransi selisih stand vs pemakaian (kWh)"),
-    ]),
-    ("Indikasi Stan Baca (Meter Macet / Rumah Kosong / Cap Jam Nyala)", [
-        ("stan_baca_flat_toleransi", "Toleransi stand baca dianggap 'tidak berubah' (kWh)"),
-        ("stan_baca_flat_min_bulan", "Jumlah bulan berturut-turut untuk pola flat"),
-        ("stan_baca_placeholder_max", "Nilai stand dianggap placeholder / tidak dibaca (<=)"),
+    ("Cabut/Pasang Meter",
+     "Saat ganti meter atau mutasi tarif, pemakaian dipecah dua segmen: "
+     "(stand cabut - stand awal) + (stand kini - stand pasang). Ditandai bila "
+     "hasilnya beda dari pemakaian yang ditagih.", [
+        ("cabut_pasang_toleransi", "Toleransi beda pemakaian hitung vs ditagih (kWh)"),
     ]),
 ]
 
@@ -554,7 +572,7 @@ class App:
         dialog.title("Pengaturan Rule Deteksi Anomali")
         dialog.transient(self.root)
         dialog.grab_set()
-        dialog.geometry("480x560")
+        dialog.geometry("580x660")
 
         tb.Label(
             dialog,
@@ -587,21 +605,43 @@ class App:
 
         field_vars = {}
         row = 0
-        for group_title, fields in RULE_FIELD_GROUPS:
+        for group_title, group_desc, fields in RULE_FIELD_GROUPS:
             tb.Label(
                 scroll_frame,
                 text=group_title,
                 font=("Segoe UI", 10, "bold"),
                 bootstyle=INFO,
-            ).grid(row=row, column=0, columnspan=2, sticky=W, pady=(10, 2), padx=(0, 10))
+            ).grid(row=row, column=0, columnspan=3, sticky=W, pady=(12, 2), padx=(0, 10))
             row += 1
+
+            # Kalimat penjelas grup: dialog ini dipakai orang yang tidak
+            # membaca kode, jadi tiap rule dijelaskan sekali di sini daripada
+            # memaksa label field jadi panjang.
+            # Sengaja TIDAK memakai bootstyle=SECONDARY: di tema darkly warnanya
+            # abu gelap di atas latar gelap dan praktis tidak terbaca. Ukuran
+            # font yang lebih kecil sudah cukup membedakannya dari label field.
+            tb.Label(
+                scroll_frame,
+                text=group_desc,
+                font=("Segoe UI", 9),
+                wraplength=520,
+                justify=LEFT,
+            ).grid(row=row, column=0, columnspan=3, sticky=W, pady=(0, 8), padx=(10, 15))
+            row += 1
+
             for key, label in fields:
-                tb.Label(scroll_frame, text=label, font=("Segoe UI", 9)).grid(
-                    row=row, column=0, sticky=W, padx=(10, 8), pady=2
-                )
+                tb.Label(
+                    scroll_frame, text=label, font=("Segoe UI", 9),
+                    wraplength=300, justify=LEFT,
+                ).grid(row=row, column=0, sticky=W, padx=(10, 8), pady=2)
                 var = tk.StringVar(value=str(current.get(key, settings.DEFAULT_RULES[key])))
-                entry = tb.Entry(scroll_frame, textvariable=var, width=10, font=("Segoe UI", 9))
-                entry.grid(row=row, column=1, sticky=W, pady=2, padx=(0, 15))
+                entry = tb.Entry(scroll_frame, textvariable=var, width=8, font=("Segoe UI", 9))
+                entry.grid(row=row, column=1, sticky=W, pady=2)
+                tb.Label(
+                    scroll_frame,
+                    text="%" if key in FIELD_PERSEN else "",
+                    font=("Segoe UI", 9),
+                ).grid(row=row, column=2, sticky=W, pady=2, padx=(3, 15))
                 field_vars[key] = var
                 row += 1
 
@@ -616,7 +656,11 @@ class App:
             new_rules = {}
             try:
                 for key, var in field_vars.items():
-                    raw = var.get().strip()
+                    # Field persen berlabel "(%)" dan bertanda "%" di sebelah
+                    # kotaknya, jadi isian "50%" wajar diketik dan harus
+                    # diterima - tanpa rstrip, float("50%") gagal dan input
+                    # yang maksudnya sudah jelas ditolak sebagai bukan angka.
+                    raw = var.get().strip().rstrip("%").strip()
                     if isinstance(settings.DEFAULT_RULES[key], int):
                         new_rules[key] = int(float(raw))
                     else:

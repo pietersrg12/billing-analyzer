@@ -6,9 +6,17 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.formatting.rule import FormulaRule
 
+from core.analyzer import STATUS_JAM_TINGGI
+from core.cabut_pasang import (
+    KOLOM_CABUT_PASANG,
+    MASALAH_CABUT,
+    MASALAH_PASANG,
+    MASALAH_SELISIH,
+)
 from core.koreksi import (
     ALASAN_MAP,
     PILIHAN_BELUM_PDL,
+    PILIHAN_BIARKAN,
     PILIHAN_CAP720,
     PILIHAN_MANUAL,
     PILIHAN_OPTIONS,
@@ -59,16 +67,92 @@ def font_perubahan(val):
 BLOK_REKENING = ("STAND_LALU", "STAND_KINI", "PEMAKAIAN_BULAN_LALU", "PEMAKAIAN")
 BLOK_STAN_BACA = ("STAND_BACA_LALU", "PEMAKAIAN_ASLI", "SELISIH_STAN_BACA")
 BLOK_RATA2 = ("RATA2",)
+BLOK_CABUT_PASANG = KOLOM_CABUT_PASANG
+
+# Teks penanda di kolom PILIHAN sheet status untuk baris yang koreksinya
+# dipegang sheet CABUT_PASANG (lihat catatan kepemilikan di export_excel).
+PILIHAN_LIHAT_CABUT_PASANG = "LIHAT CABUT_PASANG"
 
 
-def _build_sheet_data(source, bulan_list, include_status=False, include_koreksi=False):
+def _rentang_baris(rows):
+    """Gabung daftar nomor baris jadi rentang kontigu [(awal, akhir), ...].
+
+    Dipakai supaya DataValidation dropdown bisa dipasang hanya pada baris
+    tertentu tanpa membuat ratusan sqref satu-satu.
+    """
+    hasil = []
+    for r in sorted(rows):
+        if hasil and r == hasil[-1][1] + 1:
+            hasil[-1][1] = r
+        else:
+            hasil.append([r, r])
+    return [(a, b) for a, b in hasil]
+
+
+def _pasang_dropdown_koreksi(ws, data_out, baris_dropdown=None):
+    """Pasang dropdown PILIHAN + highlight sel wajib isi di satu sheet.
+
+    baris_dropdown: daftar nomor baris Excel (1-based, header = 1) yang boleh
+    punya dropdown. None = semua baris data. Baris di luar daftar sengaja
+    tidak diberi dropdown karena koreksinya dipegang sheet lain.
+
+    Return (pil_letter, kwh_letter, stanm_letter).
+    """
+    pil_letter = get_column_letter(data_out.columns.get_loc("PILIHAN") + 1)
+    kwh_letter = get_column_letter(data_out.columns.get_loc("KWH_MANUAL") + 1)
+    stanm_letter = get_column_letter(data_out.columns.get_loc("STAN_MANUAL") + 1)
+
+    last_row = len(data_out) + 1
+
+    if baris_dropdown is None:
+        rentang = [(2, last_row)] if last_row >= 2 else []
+    else:
+        rentang = _rentang_baris(baris_dropdown)
+
+    if rentang:
+        dv = DataValidation(
+            type="list",
+            formula1='"' + ",".join(PILIHAN_OPTIONS) + '"',
+            allow_blank=True,
+            showDropDown=False,
+        )
+        ws.add_data_validation(dv)
+        for awal, akhir in rentang:
+            dv.add(f"{pil_letter}{awal}:{pil_letter}{akhir}")
+
+    # Pengingat visual: highlight sel yang WAJIB diisi user selama masih
+    # kosong, supaya tidak lupa - hilang otomatis begitu diisi.
+    # MANUAL -> KWH_MANUAL wajib; SALAH ENTRY -> STAN_MANUAL wajib.
+    #
+    # NOTE: fill utk conditional formatting (dxf) WAJIB set start_color DAN
+    # end_color sama-sama - beda dari fill cell biasa yang cukup start_color
+    # saja. Kalau cuma start_color, Excel diam-diam tidak merender fill-nya
+    # sama sekali (dxf fgColor tanpa bgColor).
+    for letter, pilihan, warna in (
+        (kwh_letter, PILIHAN_MANUAL, "FFFF00"),
+        (stanm_letter, PILIHAN_SALAH_ENTRY, "FFC000"),
+    ):
+        ws.conditional_formatting.add(
+            f"{letter}2:{letter}{last_row}",
+            FormulaRule(
+                formula=[f'AND(${pil_letter}2="{pilihan}",${letter}2="")'],
+                fill=PatternFill(start_color=warna, end_color=warna, fill_type="solid"),
+            ),
+        )
+
+    return pil_letter, kwh_letter, stanm_letter
+
+
+def _build_sheet_data(source, bulan_list, include_status=False, include_koreksi=False,
+                      include_cabut_pasang=False):
     """Susun kolom output untuk satu sheet.
 
-    Urutan: identitas -> blok stan rekening -> blok stan baca -> pola/kelainan
-    -> (STATUS utk sheet campuran) -> foto -> proyeksi stand.
+    Urutan: identitas -> blok stan rekening -> blok stan baca -> blok cabut/
+    pasang -> pola/kelainan -> (STATUS utk sheet campuran) -> foto ->
+    proyeksi stand.
     DETAIL digabung ke KELAINAN. STATUS hanya diikutkan untuk sheet campuran
-    (PRIORITAS_KELAINAN, BUKAN_KWH) - di sheet per-status sudah tercermin
-    dari nama sheet.
+    (PRIORITAS_KELAINAN, BUKAN_KWH, CABUT_PASANG) - di sheet per-status sudah
+    tercermin dari nama sheet.
     """
     data_out = source[[
         "IDPEL", "TARIF", "DAYA",
@@ -78,6 +162,13 @@ def _build_sheet_data(source, bulan_list, include_status=False, include_koreksi=
     for col in BLOK_STAN_BACA:
         if col in source.columns:
             data_out[col] = source[col]
+
+    # Blok cabut/pasang hanya di sheet CABUT_PASANG - di sheet lain kolomnya
+    # kosong untuk hampir semua baris, cuma bikin lebar sia-sia.
+    if include_cabut_pasang:
+        for col in BLOK_CABUT_PASANG:
+            if col in source.columns:
+                data_out[col] = source[col]
 
     data_out["RATA2"] = source["RATA2"]
 
@@ -123,6 +214,19 @@ def export_excel(df, output_file, bulan_list, klasifikasi=None, ocr_results=None
     sheet_map = {}
     koreksi_rows = []   # meta per baris untuk sheet KOREKSI_STAND
 
+    # Sheet CABUT_PASANG hanya memuat baris yang BERMASALAH - baris cabut/
+    # pasang yang standnya sehat tidak perlu diperiksa manual dan tetap
+    # dikoreksi dari sheet STATUS-nya seperti biasa.
+    # Baris bermasalah dikoreksi HANYA dari sheet CABUT_PASANG - lihat
+    # catatan kepemilikan di blok sheet tersebut.
+    if "MASALAH_CABUT_PASANG" in df.columns:
+        masalah_cp = (
+            df["ADA_CABUT_PASANG"].fillna(False).astype(bool)
+            & (df["MASALAH_CABUT_PASANG"].fillna("") != "")
+        )
+    else:
+        masalah_cp = pd.Series(False, index=df.index)
+
     for status, data in df.groupby("STATUS"):
 
         # Sort berdasarkan tipe status
@@ -138,6 +242,12 @@ def export_excel(df, output_file, bulan_list, klasifikasi=None, ocr_results=None
         )
         data_out = _build_sheet_data(data, bulan_list, include_koreksi=include_koreksi)
 
+        # Baris cabut/pasang: tandai bahwa koreksinya dilakukan di sheet
+        # CABUT_PASANG, jangan biarkan dropdown kosong yang menyesatkan.
+        cp_mask = masalah_cp.reindex(data.index).fillna(False).to_numpy()
+        if include_koreksi and cp_mask.any():
+            data_out.loc[cp_mask, "PILIHAN"] = PILIHAN_LIHAT_CABUT_PASANG
+
         sheet_name = status[:30]
         data_out.to_excel(writer, sheet_name=sheet_name, index=False)
 
@@ -145,43 +255,14 @@ def export_excel(df, output_file, bulan_list, klasifikasi=None, ocr_results=None
 
         if include_koreksi:
             ws = writer.sheets[sheet_name]
-            pil_letter = get_column_letter(data_out.columns.get_loc("PILIHAN") + 1)
-            kwh_letter = get_column_letter(data_out.columns.get_loc("KWH_MANUAL") + 1)
-            stanm_letter = get_column_letter(data_out.columns.get_loc("STAN_MANUAL") + 1)
-
-            dv = DataValidation(
-                type="list",
-                formula1='"' + ",".join(PILIHAN_OPTIONS) + '"',
-                allow_blank=True,
-                showDropDown=False,
-            )
-            ws.add_data_validation(dv)
-            dv.add(f"{pil_letter}2:{pil_letter}{len(data_out) + 1}")
-
-            # Pengingat visual: highlight sel yang WAJIB diisi user selama
-            # masih kosong, supaya tidak lupa - hilang otomatis begitu diisi.
-            # MANUAL -> KWH_MANUAL wajib; SALAH ENTRY -> STAN_MANUAL wajib.
-            last_row = len(data_out) + 1
-            # NOTE: fill utk conditional formatting (dxf) WAJIB set start_color
-            # DAN end_color sama-sama - beda dari fill cell biasa yang cukup
-            # start_color saja. Kalau cuma start_color, Excel diam-diam tidak
-            # merender fill-nya sama sekali (dxf fgColor tanpa bgColor).
-            ws.conditional_formatting.add(
-                f"{kwh_letter}2:{kwh_letter}{last_row}",
-                FormulaRule(
-                    formula=[f'AND(${pil_letter}2="{PILIHAN_MANUAL}",${kwh_letter}2="")'],
-                    fill=PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid"),
-                ),
-            )
-            ws.conditional_formatting.add(
-                f"{stanm_letter}2:{stanm_letter}{last_row}",
-                FormulaRule(
-                    formula=[f'AND(${pil_letter}2="{PILIHAN_SALAH_ENTRY}",${stanm_letter}2="")'],
-                    fill=PatternFill(start_color="FFC000", end_color="FFC000", fill_type="solid"),
-                ),
+            baris_dropdown = [i + 2 for i, cp in enumerate(cp_mask) if not cp]
+            pil_letter, kwh_letter, stanm_letter = _pasang_dropdown_koreksi(
+                ws, data_out, baris_dropdown
             )
 
             for i, (_, r) in enumerate(data_out.iterrows()):
+                if cp_mask[i]:
+                    continue   # dipegang sheet CABUT_PASANG
                 koreksi_rows.append({
                     "IDPEL": r["IDPEL"], "STATUS": status,
                     "STAND_LALU": r["STAND_LALU"], "STAND_KINI": r["STAND_KINI"],
@@ -233,6 +314,50 @@ def export_excel(df, output_file, bulan_list, klasifikasi=None, ocr_results=None
 
             data_out.to_excel(writer, sheet_name="BUKAN_KWH", index=False)
             sheet_map["BUKAN_KWH"] = data_out
+
+    # =========================
+    # SHEET CABUT_PASANG (validasi stand bongkar/pasang meter)
+    # =========================
+    # Sheet ini PEMILIK TUNGGAL koreksi untuk baris cabut/pasang. Baris yang
+    # sama juga tampil di sheet STATUS asalnya (umumnya "Stand Minus"), tapi
+    # di sana dropdown-nya sengaja dimatikan: kalau kedua sheet sama-sama
+    # mendaftar ke koreksi_rows, satu IDPEL akan punya DUA baris STAN BARU
+    # yang bisa saling bertentangan di file upload billing.
+    if masalah_cp.any() and "PILIHAN" in df.columns:
+        df_cp = df[masalah_cp].copy()
+
+        # Selisih terbesar dulu - baris dengan tagihan rollover katastrofik
+        # (mis. 100.000 kWh) muncul paling awal.
+        df_cp = df_cp.reindex(
+            pd.to_numeric(df_cp["SELISIH_CABUT_PASANG"], errors="coerce")
+            .abs().fillna(0).sort_values(ascending=False).index
+        )
+
+        data_out = _build_sheet_data(
+            df_cp, bulan_list,
+            include_status=True, include_koreksi=True, include_cabut_pasang=True,
+        )
+        # Semua baris di sheet ini boleh dikoreksi manual; tidak ada saran
+        # otomatis karena penyebabnya (salah entry stand cabut vs stand
+        # pasang vs meter memang diganti) hanya bisa dipastikan dari foto.
+        data_out["PILIHAN"] = PILIHAN_BIARKAN
+
+        data_out.to_excel(writer, sheet_name="CABUT_PASANG", index=False)
+        sheet_map["CABUT_PASANG"] = data_out
+
+        ws_cp = writer.sheets["CABUT_PASANG"]
+        pil_letter, kwh_letter, stanm_letter = _pasang_dropdown_koreksi(ws_cp, data_out)
+
+        for i, (_, r) in enumerate(data_out.iterrows()):
+            koreksi_rows.append({
+                "IDPEL": r["IDPEL"], "STATUS": "CABUT_PASANG",
+                "STAND_LALU": r["STAND_LALU"], "STAND_KINI": r["STAND_KINI"],
+                "JAM_NYALA": r["JAM_NYALA"],
+                "STAND_RATA2": r["STAND_RATA2"], "STAND_P1": r["STAND_P1"],
+                "STAND_RUMAH_KOSONG": r["STAND_RUMAH_KOSONG"],
+                "_sheet": "CABUT_PASANG", "_row": i + 2,
+                "_pil": pil_letter, "_kwh": kwh_letter, "_stanm": stanm_letter,
+            })
 
     # =========================
     # SHEET KOREKSI_STAND (siap upload)
@@ -303,8 +428,8 @@ def export_excel(df, output_file, bulan_list, klasifikasi=None, ocr_results=None
     summary_data.append(["Total Dianalisis", total])
     summary_data.append([""])
     summary_data.append(["STATUS", "JUMLAH", "%"])
-    for status_name in ["Normal","Stand Minus","Meter Macet","Kenaikan","Perlu Perhatian",
-                        "Penurunan","Jam Tinggi","Jam Tidak Wajar","Anomali Daya",
+    for status_name in ["Normal","Stand Minus","Meter Macet","Kenaikan",
+                        "Penurunan",STATUS_JAM_TINGGI,
                         "Trend Naik","Stand Tidak Wajar","DATA BARU"]:
         cnt = status_counts.get(status_name, 0)
         pct = round(cnt / total * 100, 1) if total > 0 else 0
@@ -328,6 +453,17 @@ def export_excel(df, output_file, bulan_list, klasifikasi=None, ocr_results=None
         ]:
             pct = round(count / n_total_klasif * 100, 1) if n_total_klasif > 0 else 0
             summary_data.append([label, count, pct])
+
+    # Cabut/pasang meter summary
+    if "ADA_CABUT_PASANG" in df.columns:
+        n_cp = int(df["ADA_CABUT_PASANG"].fillna(False).astype(bool).sum())
+        n_cp_masalah = int(masalah_cp.sum())
+
+        summary_data.append([""])
+        summary_data.append(["CABUT/PASANG METER"])
+        summary_data.append(["INDIKASI", "JUMLAH"])
+        summary_data.append(["Ada aktivitas cabut/pasang", n_cp])
+        summary_data.append(["Stand cabut/pasang bermasalah", n_cp_masalah])
 
     summary_data.append([""])
     summary_data.append(["Top 10 Jam Nyala Tertinggi:"])
@@ -363,6 +499,19 @@ def export_excel(df, output_file, bulan_list, klasifikasi=None, ocr_results=None
     summary_df.to_excel(writer, sheet_name="RINGKASAN", index=False, header=False)
     sheet_map["RINGKASAN"] = summary_df
 
+    # =========================
+    # URUTAN SHEET
+    # =========================
+    # Sheet per-status lahir dalam urutan groupby (alfabetis), sisanya
+    # menyusul di belakang. CABUT_PASANG ditarik ke sebelah kanan "Stand
+    # Minus" karena mayoritas temuannya memang berasal dari sana - pemeriksa
+    # bisa langsung lompat dari satu sheet ke sheet lanjutannya.
+    wb = writer.book
+    if "CABUT_PASANG" in wb.sheetnames and "Stand Minus" in wb.sheetnames:
+        ws_cp = wb["CABUT_PASANG"]
+        wb._sheets.remove(ws_cp)
+        wb._sheets.insert(wb.sheetnames.index("Stand Minus") + 1, ws_cp)
+
     writer.close()
     return sheet_map
 
@@ -377,6 +526,7 @@ def format_excel(output_file, sheet_map, results, bulan_list, ocr_results=None, 
     header_font = Font(bold=True, color="FFFFFF")
 
     center = Alignment(horizontal="center", vertical="center")
+    wrap_left = Alignment(horizontal="left", vertical="center", wrap_text=True)
     header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
     warna_status = {
@@ -404,6 +554,12 @@ def format_excel(output_file, sheet_map, results, bulan_list, ocr_results=None, 
             "cols": BLOK_RATA2,
             "header": PatternFill(start_color="7030A0", fill_type="solid"),
             "tint": PatternFill(start_color="E5DFF3", fill_type="solid"),
+        },
+        # Teal = stand bongkar/pasang meter (hanya muncul di CABUT_PASANG).
+        "cabutpasang": {
+            "cols": BLOK_CABUT_PASANG,
+            "header": PatternFill(start_color="1F7A7A", fill_type="solid"),
+            "tint": PatternFill(start_color="DAF0F0", fill_type="solid"),
         },
         # Kuning = sel yang boleh diisi/diubah user (dropdown & kWh manual).
         # Tidak dipakai di KOREKSI_STAND (di sana isinya formula, bukan input).
@@ -444,6 +600,8 @@ def format_excel(output_file, sheet_map, results, bulan_list, ocr_results=None, 
         jam_col = None
         spark_col = None
         selisih_stanbaca_col = None
+        masalah_cp_col = None
+        cp_cols = {}          # nama kolom cabut/pasang -> col_idx
         blok_col_fills = {}   # col_idx -> tint fill (untuk data cells)
         for col in range(1, ws.max_column+1):
             val = ws.cell(row=1, column=col).value
@@ -459,6 +617,10 @@ def format_excel(output_file, sheet_map, results, bulan_list, ocr_results=None, 
                 spark_col = col
             if val == "SELISIH_STAN_BACA":
                 selisih_stanbaca_col = col
+            if val == "MASALAH_CABUT_PASANG":
+                masalah_cp_col = col
+            if val in ("STAND_CABUT", "STAND_PASANG", "SELISIH_CABUT_PASANG"):
+                cp_cols[val] = col
             for blok_name, blok in blok_style.items():
                 if blok_name == "koreksi" and sheet_name == "KOREKSI_STAND":
                     continue
@@ -494,10 +656,10 @@ def format_excel(output_file, sheet_map, results, bulan_list, ocr_results=None, 
                         cell.alignment = center
                 elif val and isinstance(val, str) and (
                     "Top 10" in val or "Total" in val or "KLASIFIKASI" in val
-                    or "INDIKASI STAN BACA" in val
+                    or "CABUT/PASANG METER" in val
                 ):
                     ws.cell(row=row_num, column=1).font = bold_font
-                    if "Top 10" in val or "KLASIFIKASI" in val or "INDIKASI STAN BACA" in val:
+                    if "Total" not in val:
                         ws.cell(row=row_num, column=1).fill = section_fill
 
                 # warna %PERUBAHAN di ringkasan
@@ -570,11 +732,33 @@ def format_excel(output_file, sheet_map, results, bulan_list, ocr_results=None, 
                     sel_cell.fill = PatternFill(start_color="FFD966", fill_type="solid")
                     sel_cell.font = Font(bold=True)
 
+            # PELANGGARAN CABUT/PASANG - warnai kolom stand yang jadi
+            # penyebabnya, dibaca dari teks MASALAH_CABUT_PASANG supaya
+            # sumber kebenarannya tetap satu (core/cabut_pasang.py).
+            if masalah_cp_col:
+                masalah_cell = ws.cell(row=row_idx, column=masalah_cp_col)
+                masalah = str(masalah_cell.value or "")
+                if masalah:
+                    masalah_cell.fill = PatternFill(start_color="FFC7CE", fill_type="solid")
+                    masalah_cell.font = Font(bold=True, color="9C0006")
+
+                    for teks, nama_kolom in (
+                        (MASALAH_CABUT, "STAND_CABUT"),
+                        (MASALAH_PASANG, "STAND_PASANG"),
+                        (MASALAH_SELISIH, "SELISIH_CABUT_PASANG"),
+                    ):
+                        if teks in masalah and nama_kolom in cp_cols:
+                            bad = ws.cell(row=row_idx, column=cp_cols[nama_kolom])
+                            bad.fill = PatternFill(start_color="FF9999", fill_type="solid")
+                            bad.font = Font(bold=True)
+
             # BORDER + ALIGN
             for col in range(1, ws.max_column+1):
                 c = ws.cell(row=row_idx, column=col)
                 c.border = border
-                c.alignment = center
+                # Teks masalah panjang: rata kiri + wrap supaya terbaca utuh,
+                # sisanya rata tengah seperti kolom angka lain.
+                c.alignment = wrap_left if col == masalah_cp_col else center
 
             # SPARKLINE font styling
             if spark_col:
@@ -640,6 +824,8 @@ def format_excel(output_file, sheet_map, results, bulan_list, ocr_results=None, 
                 ws.column_dimensions[letter].width = 12
             elif val == "ALASAN KOREKSI":
                 ws.column_dimensions[letter].width = 55
+            elif val == "MASALAH_CABUT_PASANG":
+                ws.column_dimensions[letter].width = 34
 
         # =========================
         # HIDE KOLOM PROYEKSI STAND

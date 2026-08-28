@@ -2,13 +2,38 @@
 foto/
 dpm/
 hasil/
+Output/
 periode billing/
-database.xlsb
+unduhan/
+db_backup/
 
-# Runtime files
+# Database historis (dibuat/di-update lokal, bukan sumber kode)
+database*.xlsb
+database*.xlsx
+hasil_verifikasi.xlsx
+
+# Runtime files / kredensial
 cookie.json
 stand_cache.json
 stand_results_tesseract.csv
+simba_token.json
+billing_token.json
+rule_settings.json
+selftest.log
+error.log
+
+# Bobot model (besar, di-bundle terpisah saat build)
+model/
+*.pt
+
+# Artefak build
+build/
+dist/
+
+# Dataset & hasil crop YOLO
+yolo_dataset/
+yolo_cropped*/
+yolo_display/
 
 # Driver
 chromedriver.exe
@@ -27,7 +52,19 @@ Thumbs.db
 desktop.ini
 .DS_Store
 
+# File kunci Excel
+~$*
+
 # Other
 instal ini.txt
 CLAUDE.md
 .claude/
+
+# Capture trafik HTTP untuk referensi implementasi.
+# JANGAN di-commit: berisi password plaintext dan bearer token yang masih hidup.
+login/
+download data base/
+
+# Keluaran presentasi (dibuat ulang oleh presentasi/siapkan_gambar.py + buat_ppt.py)
+presentasi/*.pptx
+presentasi/gambar/

@@ -27,6 +27,22 @@ COL_MAP = {
     "keterangan_dlpd": "KELAINAN",
 }
 
+# Kolom bongkar/pasang meter - OPSIONAL, hanya ada di export DPM yang lebih
+# baru (mulai sekitar 202607). Export lama tidak punya kolom ini, jadi tidak
+# boleh masuk REQUIRED_COLS: core/cabut_pasang.py degrade ke no-op kalau
+# kolomnya tidak terbawa.
+#
+# CATATAN: STAND_AWAL (slalwbp) BUKAN STAND_LALU. STAND_LALU berasal dari
+# database.xlsb (stand historis terakhir yang tercatat), sedangkan STAND_AWAL
+# adalah stand awal periode menurut baris DPM itu sendiri. Validasi cabut/
+# pasang membandingkan terhadap STAND_AWAL, karena billing memecah pemakaian
+# memakai angka dari baris DPM yang sama.
+COL_MAP_OPSIONAL = {
+    "slalwbp":        "STAND_AWAL",
+    "sahlwbp_cabut":  "STAND_CABUT",
+    "slalwbp_pasang": "STAND_PASANG",
+}
+
 
 def _read_excel_auto(path):
     """Baca Excel, pilih engine berdasarkan ekstensi."""
@@ -56,7 +72,9 @@ def load_data(dpm_path, db_path):
 
     Returns
     -------
-    dpm : DataFrame dengan kolom IDPEL, STAND_KINI, PEMAKAIAN, DAYA, TARIF, KELAINAN
+    dpm : DataFrame dengan kolom IDPEL, STAND_KINI, PEMAKAIAN, DAYA, TARIF,
+          KELAINAN, plus STAND_AWAL/STAND_CABUT/STAND_PASANG bila tersedia
+          di file (lihat COL_MAP_OPSIONAL)
     db  : DataFrame database historis (IDPEL, BULAN, STAND, PEMAKAIAN, DAYA, KEY)
     """
 
@@ -81,14 +99,19 @@ def load_data(dpm_path, db_path):
     # =========================
     # MAPPING & SELEKSI KOLOM
     # =========================
-    dpm = dpm[list(COL_MAP.keys())].rename(columns=COL_MAP)
+    opsional = [c for c in COL_MAP_OPSIONAL if c in dpm.columns]
+    dpm = dpm[list(COL_MAP.keys()) + opsional].rename(
+        columns={**COL_MAP, **COL_MAP_OPSIONAL}
+    )
 
     # =========================
     # CLEANING
     # =========================
     dpm["IDPEL"] = dpm["IDPEL"].astype(str).str.strip()
 
-    for col in ["STAND_KINI", "PEMAKAIAN", "DAYA"]:
+    num_cols = ["STAND_KINI", "PEMAKAIAN", "DAYA"]
+    num_cols += [COL_MAP_OPSIONAL[c] for c in opsional]
+    for col in num_cols:
         dpm[col] = pd.to_numeric(dpm[col], errors="coerce").fillna(0)
 
     dpm["TARIF"] = dpm["TARIF"].fillna("").astype(str).str.strip()

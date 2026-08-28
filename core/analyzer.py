@@ -1,5 +1,10 @@
 import pandas as pd
 
+# Nama STATUS sekaligus nama sheet Excel untuk pemakaian melewati batas jam
+# nyala. Dipakai juga di core/excel.py (urutan RINGKASAN) - jangan diketik
+# ulang sebagai literal supaya tidak lepas sinkron.
+STATUS_JAM_TINGGI = ">720JN"
+
 # =========================
 # RULES
 # =========================
@@ -17,35 +22,29 @@ def rule_meter_macet(r, cfg):
     return None
 
 def rule_jam(r, cfg):
-    if r["JAM_NYALA"] > cfg["jam_nyala_tidak_wajar_min"]:
-        return "Jam Tidak Wajar",""
+    # "Jam Tinggi" (>=720) dan "Jam Tidak Wajar" (>744) digabung 2026-08 atas
+    # permintaan user - dua sheet terpisah tidak menambah nilai pemeriksaan,
+    # keduanya sama-sama berarti pemakaian melewati batas fisik daya.
     if r["JAM_NYALA"] >= cfg["jam_nyala_tinggi_min"]:
-        return "Jam Tinggi",""
+        return STATUS_JAM_TINGGI,""
     return None
 
 def rule_kenaikan(r, cfg):
-    if r["PEMAKAIAN"] > cfg["kenaikan_pemakaian_min"] and r["PEMAKAIAN"] > max(
-        cfg["kenaikan_multiplier"] * r["RATA2"], r["RATA2"] + cfg["kenaikan_tambahan"]
-    ):
+    # NOTE: cabang kedua `max(..., RATA2 + kenaikan_tambahan)` dihapus 2026-08.
+    # Dengan kenaikan_pemakaian_min = 150, cabang itu tidak pernah jadi
+    # penentu: untuk RATA2 < 100 hasilnya selalu di bawah 150 (kalah oleh
+    # batas pemakaian minimum), dan untuk RATA2 >= 100 selalu kalah oleh
+    # batas persen. Diuji di data 202608: nilai 0 maupun 50 sama-sama
+    # menghasilkan 319 baris Kenaikan.
+    batas = (1 + cfg["kenaikan_persen_min"] / 100) * r["RATA2"]
+    if r["PEMAKAIAN"] > cfg["kenaikan_pemakaian_min"] and r["PEMAKAIAN"] > batas:
         return "Kenaikan",""
     return None
 
-def rule_perlu_perhatian(r, cfg):
-    if r["RATA2"] > 0 and r["PEMAKAIAN"] > 0:
-        ratio = r["PEMAKAIAN"] / r["RATA2"]
-        if (cfg["perlu_perhatian_ratio_min"] <= ratio < cfg["perlu_perhatian_ratio_max"]
-                and r["PEMAKAIAN"] > cfg["perlu_perhatian_pemakaian_min"]):
-            return "Perlu Perhatian",""
-    return None
-
 def rule_penurunan(r, cfg):
-    if r["PEMAKAIAN"] > 0 and r["PEMAKAIAN"] < cfg["penurunan_ratio_max"] * r["RATA2"]:
+    batas = (1 - cfg["penurunan_persen_min"] / 100) * r["RATA2"]
+    if r["PEMAKAIAN"] > 0 and r["PEMAKAIAN"] < batas:
         return "Penurunan",""
-    return None
-
-def rule_anomali(r, cfg):
-    if r["PEMAKAIAN"] > r["DAYA"] * cfg["anomali_daya_multiplier"]:
-        return "Anomali Daya",""
     return None
 
 def rule_trend_naik(r, cfg):
@@ -62,16 +61,22 @@ def rule_stand_tidak_wajar(r, cfg):
 
 # NOTE: rule "Anomali vs Sejawat" (peer median) dihapus 2026-07 atas
 # permintaan user - tidak pernah menghasilkan temuan riil di lapangan.
+# NOTE: rule "Perlu Perhatian" (pemakaian 1.2-1.5x RATA2) dihapus 2026-08 atas
+# permintaan user - sheetnya nyaris tidak pernah diperiksa. Baris yang dulu
+# masuk ke sana kini jatuh ke rule berikutnya, umumnya jadi "Normal" sehingga
+# ikut hemat kuota download foto.
+# NOTE: rule "Anomali Daya" (PEMAKAIAN > DAYA * 2) dihapus 2026-08 - tidak
+# pernah tercapai. rule_jam berjalan lebih dulu dan sudah menangkap semua yang
+# jam nyalanya >= 720; supaya rule ini sempat kena, pengalinya harus < 0.72.
+# Terbukti di data 202608: 0 baris.
 RULES = [
     rule_stand_minus,
     rule_stand_tidak_wajar,
     rule_meter_macet,
     rule_jam,
     rule_kenaikan,
-    rule_perlu_perhatian,
     rule_trend_naik,
     rule_penurunan,
-    rule_anomali
 ]
 
 # =========================
@@ -154,7 +159,7 @@ def prepare(df, db, cfg):
     trend_mask = (
         (trend_agg["n"] >= cfg["trend_min_bulan"]) &
         (trend_agg["ups"] >= trend_agg["n"] - 1) &
-        (trend_agg["last_val"] > trend_agg["first_val"] * cfg["trend_growth_ratio"])
+        (trend_agg["last_val"] > trend_agg["first_val"] * (1 + cfg["trend_persen_min"] / 100))
     )
     trend_idpels = trend_agg[trend_mask].index.tolist()
 

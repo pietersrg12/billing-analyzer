@@ -31,6 +31,7 @@ from core.analyzer import (
     compute_stanbaca_comparison,
     prepare,
 )
+from core.cabut_pasang import compute_cabut_pasang, ringkasan as ringkasan_cabut_pasang
 from core.classifier import classify_all, is_available as classifier_available
 from core.excel import export_excel, format_excel
 from core.koreksi import tambah_saran_koreksi
@@ -183,6 +184,11 @@ def run_pipeline(
     if stanbaca_db is not None:
         df = compute_stanbaca_comparison(df, stanbaca_db, blth, cfg)
 
+    df = compute_cabut_pasang(df, cfg)
+    n_cp, n_cp_masalah = ringkasan_cabut_pasang(df)
+    if n_cp:
+        log(f"Cabut/pasang meter: {n_cp} pelanggan, {n_cp_masalah} stand bermasalah")
+
     percent(20)
 
     if stop_flag and stop_flag():
@@ -190,7 +196,13 @@ def run_pipeline(
         return
 
     # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ FILTER UNTUK FOTO Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-    df_foto = df[df["STATUS"] != "Normal"].copy()
+    # Stand cabut/pasang yang bermasalah tetap difoto walau STATUS-nya Normal:
+    # tanpa foto, pemeriksa tidak punya cara memastikan stand mana yang salah.
+    mask_foto = df["STATUS"] != "Normal"
+    if "MASALAH_CABUT_PASANG" in df.columns:
+        mask_foto = mask_foto | (df["MASALAH_CABUT_PASANG"] != "")
+
+    df_foto = df[mask_foto].copy()
     df_foto["IDPEL"] = df_foto["IDPEL"].astype(str)
 
     # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ SIMBA + DOWNLOAD FOTO + KLASIFIKASI Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬

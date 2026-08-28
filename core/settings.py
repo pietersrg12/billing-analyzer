@@ -13,25 +13,22 @@ import os
 
 from config import RULE_SETTINGS_FILE
 
+# NOTE: setelan perbandingan pemakaian disimpan sebagai PERSEN, bukan pengali
+# (2026-08). Key-nya sengaja diganti nama saat konversi - kalau nama lama
+# dipertahankan, rule_settings.json lama yang berisi 1.5 akan terbaca sebagai
+# "1,5%" dan diam-diam mengubah hasil deteksi. Dengan nama baru, key lama
+# otomatis diabaikan load_rules() dan default baru yang dipakai.
 DEFAULT_RULES = {
     "jumlah_bulan_rata2": 6,
     "jam_nyala_tinggi_min": 720,
-    "jam_nyala_tidak_wajar_min": 744,
     "stand_p1_jam_konstan": 718,
     "kenaikan_pemakaian_min": 150,
-    "kenaikan_multiplier": 1.5,
-    "kenaikan_tambahan": 50,
-    "perlu_perhatian_ratio_min": 1.2,
-    "perlu_perhatian_ratio_max": 1.5,
-    "perlu_perhatian_pemakaian_min": 100,
-    "penurunan_ratio_max": 0.5,
-    "anomali_daya_multiplier": 2,
+    "kenaikan_persen_min": 50,      # dulu kenaikan_multiplier 1.5
+    "penurunan_persen_min": 50,     # dulu penurunan_ratio_max 0.5
     "trend_min_bulan": 3,
-    "trend_growth_ratio": 1.3,
+    "trend_persen_min": 30,         # dulu trend_growth_ratio 1.3
     "stand_tidak_wajar_toleransi": 1,
-    "stan_baca_flat_toleransi": 0,
-    "stan_baca_flat_min_bulan": 3,
-    "stan_baca_placeholder_max": 1,
+    "cabut_pasang_toleransi": 1,
 }
 
 
