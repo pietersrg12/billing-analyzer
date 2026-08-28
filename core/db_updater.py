@@ -60,6 +60,47 @@ def _kolom_lower(df):
     return {str(c).strip().lower(): c for c in df.columns}
 
 
+def _idpel_teks(seri):
+    """IDPEL -> string digit murni.
+
+    Kolom IDPEL datang sebagai angka, dan satu sel kosong saja sudah cukup
+    membuat pandas menjadikan kolomnya float - astype(str) lalu menghasilkan
+    "443200000197.0". IDPEL berekor ".0" tidak akan cocok dengan IDPEL mana pun
+    di DPM, jadi seluruh database hasil unduhan jadi tidak berguna tanpa
+    diketahui. Lewat Int64 dulu supaya ekornya tidak pernah muncul.
+    """
+    angka = pd.to_numeric(seri, errors="coerce")
+    if angka.notna().any():
+        teks = angka.astype("Int64").astype(str)
+        # Sel yang memang bukan angka dikembalikan ke teks aslinya.
+        return teks.where(angka.notna(), seri.astype(str)).str.strip()
+    return seri.astype(str).str.strip()
+
+
+def _cari_baris_header(path, kolom_kunci, batas=12):
+    """Baca ulang file dengan header digeser sampai `kolom_kunci` ketemu.
+
+    Return (DataFrame, peta_kolom) atau None kalau tetap tidak ketemu.
+    """
+    for baris in range(1, batas + 1):
+        try:
+            ulang = _read_excel_auto_header(path, baris)
+        except Exception:
+            continue
+        peta = _kolom_lower(ulang)
+        if kolom_kunci in peta:
+            return ulang, peta
+    return None
+
+
+def _read_excel_auto_header(path, header):
+    """_read_excel_auto tapi dengan baris header eksplisit."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".xlsb":
+        return pd.read_excel(path, engine="pyxlsb", header=header)
+    return pd.read_excel(path, header=header)
+
+
 def parse_billing_export(path, thblrek):
     """Export Monitoring_Billing_Detail -> DataFrame skema database rekening.
 
@@ -71,6 +112,13 @@ def parse_billing_export(path, thblrek):
         raise DbUpdateError(f"Tidak bisa membaca file export {os.path.basename(path)}: {e}")
 
     kol = _kolom_lower(raw)
+
+    # Sebagian laporan PLN menaruh blok judul di atas header (laporan kode baca
+    # header-nya di baris ke-8). Layout export billing belum pernah terverifikasi,
+    # jadi kalau baris pertama bukan header, cari header-nya beberapa baris ke
+    # bawah alih-alih langsung menyerah.
+    if "idpel" not in kol:
+        raw, kol = _cari_baris_header(path, "idpel", batas=12) or (raw, kol)
 
     # sahlwbp = stand akhir periode, pemkwh_real = pemakaian riil (bukan
     # pemkwh yang sudah kena penyesuaian billing).
@@ -85,7 +133,7 @@ def parse_billing_export(path, thblrek):
         )
 
     out = pd.DataFrame()
-    out["IDPEL"] = raw[kol["idpel"]].astype(str).str.strip()
+    out["IDPEL"] = _idpel_teks(raw[kol["idpel"]])
 
     if "thblrek" in kol:
         bulan = pd.to_numeric(raw[kol["thblrek"]], errors="coerce")
@@ -142,8 +190,7 @@ def parse_kode_baca_export(xlsx_bytes, kdbaca=None):
         return pd.DataFrame(columns=KOLOM_STAN_BACA)
 
     out = pd.DataFrame(index=raw.index)
-    # Sel IDPEL numerik; lewat Int64 dulu supaya tidak jadi "4.4320e+11".
-    out["IDPEL"] = idpel_num[idpel_num.notna()].astype("int64").astype(str)
+    out["IDPEL"] = _idpel_teks(raw[kol["idpel"]])
     out["STAN METER"] = pd.to_numeric(raw[kol["stan meter"]], errors="coerce")
     out["STAN BACA"] = (
         pd.to_numeric(raw[kol["stan baca"]], errors="coerce")
