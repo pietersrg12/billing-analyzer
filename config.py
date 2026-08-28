@@ -171,6 +171,12 @@ KODE_BACA_KATEGORI = ("NORMAL", "GANGGUAN BACA", "GANGGUAN METER")
 
 ENABLE_DB_DOWNLOAD = True   # False = tombol "Cek Database" tidak ditampilkan
 
+# Unduhan file input DLPD. Butuh DUA export: DLPD (semua kolom yang dipakai
+# aplikasi) dan DPM (hanya untuk kolom kelainan_bc_meter, yang tidak ada di
+# export DLPD), lalu digabung lewat lookup idpel.
+UNDUH_SETTINGS_FILE = user_path("unduh_settings.json")
+ENABLE_UNDUH_DLPD = True
+
 UNDUHAN_DIR = user_path("unduhan")      # arsip file mentah hasil download
 DB_BACKUP_DIR = user_path("db_backup")  # salinan database sebelum ditimpa
 
@@ -193,6 +199,16 @@ ENABLE_CLASSIFIER = True
 # kalau suatu saat mau dihidupkan lagi (kolom Excel-nya perlu ditambah ulang).
 ENABLE_DIGIT_READER = False
 DIGIT_MODEL_PATH = resource_path("model", "digit_detector.pt")
+
+# =========================
+# IDENTITAS APLIKASI
+# =========================
+# Dikumpulkan di sini supaya teks kredit tidak tercecer di banyak tempat.
+APP_NAMA = "PLN Billing Analyzer"
+APP_VERSI = "2.0"
+APP_TEMPAT = "Dompu"
+APP_TAHUN = "2026"
+APP_PEMBUAT = "PMPS"
 
 # =========================
 # UI

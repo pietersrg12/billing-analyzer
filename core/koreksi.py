@@ -38,6 +38,8 @@ karena butuh penilaian kasus per kasus yang tidak aman ditebak sistem.
 
 import pandas as pd
 
+from core.loader import kelainan_meter
+
 # Keyword KELAINAN yang menandakan meter tidak bisa dibaca dengan benar.
 # Format DPM Monitoring DLPD memakai kode DLPD (mis. "M KWH MAXIMUM"), tapi
 # export lain bisa membawa nama kelainan baca - keduanya dicakup di sini.
@@ -113,7 +115,13 @@ def tambah_saran_koreksi(df, cfg, klasifikasi=None):
     # 2. Sheet "Stand Minus" -> RATA2 (tak terbaca) atau RUMAH KOSONG
     is_stand_minus = df["STATUS"] == "Stand Minus"
 
-    kelainan = df["KELAINAN"].fillna("").astype(str).str.upper()
+    # Dicocokkan HANYA ke segmen kelainan_bc_meter, bukan ke seluruh KELAINAN.
+    # Kata kuncinya kosakata kelainan baca meter; kalau diadu dengan teks DLPD,
+    # "PECAH" akan kena "J REKENING PECAHAN" - istilah rekening, bukan meter
+    # rusak - dan menyarankan RATA2 untuk baris yang seharusnya RUMAH KOSONG.
+    # File input lama (tanpa segmen bc-meter) menghasilkan "" di sini, jadi
+    # perilakunya sama persis seperti sebelum kolom gabungan ada.
+    kelainan = kelainan_meter(df["KELAINAN"]).str.upper()
     kel_tak_terbaca = pd.Series(False, index=df.index)
     for kw in KELAINAN_TAK_TERBACA_KEYWORDS:
         kel_tak_terbaca |= kelainan.str.contains(kw, regex=False)

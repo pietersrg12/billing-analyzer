@@ -44,6 +44,31 @@ COL_MAP_OPSIONAL = {
 }
 
 
+# Pemisah antara kelainan_bc_meter dan keterangan_dlpd di kolom KELAINAN
+# file input hasil gabungan (lihat core/dlpd_merge.py).
+SEPARATOR_KELAINAN = " | "
+
+
+def kelainan_meter(seri):
+    """Ambil segmen kelainan_bc_meter dari KELAINAN gabungan.
+
+    Mengembalikan "" untuk nilai tanpa separator. Itu disengaja: file input
+    lama (belum digabung dengan export DPM) isinya murni teks DLPD, dan
+    mencocokkan kata kunci kelainan baca ke teks DLPD justru salah - "PECAH"
+    akan kena "J REKENING PECAHAN", yang sama sekali bukan kelainan baca meter.
+    Dengan "" sebagai nilai jatuhan, file lama berperilaku persis seperti
+    sebelum fitur gabungan ada.
+    """
+    teks = seri.fillna("").astype(str)
+    punya = teks.str.contains(SEPARATOR_KELAINAN, regex=False)
+    # regex=False WAJIB: separatornya mengandung "|", dan pandas memperlakukan
+    # pat multi-karakter sebagai regex secara default - " | " lalu terbaca
+    # sebagai alternasi "spasi ATAU spasi" dan memotong di spasi pertama,
+    # sehingga "GANTI KWH METER | ..." jadi "GANTI".
+    potong = teks.str.split(SEPARATOR_KELAINAN, n=1, regex=False)
+    return potong.str[0].where(punya, "").str.strip()
+
+
 def _read_excel_auto(path):
     """Baca Excel, pilih engine berdasarkan ekstensi."""
     ext = os.path.splitext(path)[1].lower()

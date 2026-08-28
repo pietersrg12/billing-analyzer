@@ -45,11 +45,13 @@ from core.excel import export_excel, format_excel
 from core.koreksi import tambah_saran_koreksi
 from core.billing_client import BillingAuthError, BillingClient
 from core.db_updater import (
+    DbUpdateError,
     append_rekening,
     append_stanbaca,
     parse_billing_export,
     parse_kode_baca_export,
 )
+from core.dlpd_merge import gabung_dlpd_dpm
 from core.loader import _read_excel_auto, load_data, load_stanbaca_data
 from core.photo import download_photos
 from core.reader import is_available as reader_available
@@ -750,3 +752,102 @@ def _hapus_token(path):
             os.remove(path)
     except OSError:
         pass
+
+
+def run_unduh_dlpd(
+    blth,
+    kd_proses,
+    progress_callback=None,
+    stop_flag=None,
+    billing_login_event=None,
+    billing_credentials_holder=None,
+):
+    """Unduh export DLPD + DPM lalu gabungkan jadi satu file input.
+
+    Dua file diperlukan karena export DLPD tidak membawa `kelainan_bc_meter`;
+    kolom itu hanya ada di export DPM dan di-lookup lewat idpel.
+
+    Return dict statistik dari gabung_dlpd_dpm (termasuk `path` file hasil),
+    atau None kalau dibatalkan.
+    """
+
+    def log(msg):
+        if progress_callback:
+            progress_callback(("log", msg))
+
+    def percent(p):
+        if progress_callback:
+            progress_callback(("percent", p))
+
+    if not kd_proses:
+        raise DbUpdateError("Belum ada Kd Proses yang dipilih")
+
+    setelan = settings.load_unduh_settings()
+    percent(0)
+    log(f"=== UNDUH FILE DLPD {blth} ===")
+    log(f"Kd Proses: {', '.join(kd_proses)}")
+
+    try:
+        client = _get_billing_client(
+            progress_callback, billing_login_event, billing_credentials_holder
+        )
+
+        if stop_flag and stop_flag():
+            log("Dibatalkan")
+            return None
+
+        os.makedirs(UNDUHAN_DIR, exist_ok=True)
+        path_dlpd = os.path.join(UNDUHAN_DIR, f"Monitoring_Dlpd_Detail_{blth}.xlsx")
+        path_dpm = os.path.join(UNDUHAN_DIR, f"Monitoring_DPM_Detail_{blth}.xlsx")
+
+        log(f"Unduh export DLPD {blth} (unit {client.unitap}/{client.unitup})...")
+        percent(10)
+        n = client.download_dlpd_detail(
+            blth, kd_proses, path_dlpd,
+            dlpd=setelan["dlpd"],
+            status_verifikasi=setelan["status_verifikasi_dlpd"],
+        )
+        log(f"  file DLPD diterima {n / 1048576:.1f} MB")
+        percent(40)
+
+        if stop_flag and stop_flag():
+            log("Dibatalkan")
+            return None
+
+        # DPM ditarik dengan Kd Proses yang SAMA supaya setiap baris DLPD punya
+        # peluang ketemu pasangannya; kalau pilihannya berbeda, sebagian baris
+        # pasti tidak cocok bukan karena datanya memang tidak ada.
+        log(f"Unduh export DPM {blth} (untuk kolom kelainan_bc_meter)...")
+        n = client.download_dpm_detail(
+            blth, kd_proses, path_dpm,
+            kodeposting=setelan["kodeposting_dpm"],
+        )
+        log(f"  file DPM diterima {n / 1048576:.1f} MB")
+        percent(70)
+
+    except BillingAuthError:
+        _hapus_token(BILLING_TOKEN_FILE)
+        raise
+
+    if stop_flag and stop_flag():
+        log("Dibatalkan")
+        return None
+
+    path_keluar = os.path.join(UNDUHAN_DIR, f"DLPD_{blth}_gabungan.xlsx")
+    log("Gabungkan kelainan_bc_meter ke keterangan_dlpd...")
+    stat = gabung_dlpd_dpm(path_dlpd, path_dpm, path_keluar)
+
+    log(f"  DLPD {stat['n_dlpd']:,} baris, DPM {stat['n_dpm']:,} baris")
+    log(f"  {stat['n_cocok']:,} baris dapat kelainan_bc_meter")
+    if stat.get("n_sudah_gabung"):
+        log(f"  {stat['n_sudah_gabung']:,} baris sudah bergabung sebelumnya - dilewati")
+    if stat["n_tak_cocok"]:
+        # Sedikit tidak cocok itu wajar (DLPD memuat pelanggan yang tidak
+        # terbawa filter DPM); kalau angkanya besar, biasanya Kd Proses atau
+        # filter kodeposting-nya yang perlu diperiksa.
+        log(f"  {stat['n_tak_cocok']:,} baris tanpa pasangan di DPM "
+            f"- keterangan_dlpd-nya dibiarkan apa adanya")
+    log(f"File siap dipakai: {path_keluar}")
+    percent(100)
+
+    return stat

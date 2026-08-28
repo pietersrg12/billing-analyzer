@@ -16,9 +16,24 @@ except ImportError:
     HAS_DND = False
 
 from core.loader import read_blth
-from core.pipeline import run_db_check, run_db_update, run_pipeline
+from core.pipeline import (
+    run_db_check,
+    run_db_update,
+    run_pipeline,
+    run_unduh_dlpd,
+)
 from core import settings
-from config import ENABLE_DB_DOWNLOAD, THEME_DARK, THEME_LIGHT
+from config import (
+    APP_NAMA,
+    APP_PEMBUAT,
+    APP_TAHUN,
+    APP_TEMPAT,
+    APP_VERSI,
+    ENABLE_DB_DOWNLOAD,
+    ENABLE_UNDUH_DLPD,
+    THEME_DARK,
+    THEME_LIGHT,
+)
 
 
 class CredentialsHolder:
@@ -194,6 +209,15 @@ class App:
         )
         self.rule_settings_btn.pack(side=RIGHT, padx=(5, 0))
 
+        self.about_btn = tb.Button(
+            btn_frame,
+            text="ℹ",
+            bootstyle=(SECONDARY, OUTLINE),
+            command=self._show_about_dialog,
+            width=3,
+        )
+        self.about_btn.pack(side=RIGHT, padx=(5, 0))
+
         if ENABLE_DB_DOWNLOAD:
             self.db_check_btn = tb.Button(
                 btn_frame,
@@ -244,6 +268,18 @@ class App:
             width=12,
         )
         self.browse_btn.pack(side=RIGHT)
+
+        if ENABLE_UNDUH_DLPD:
+            self.unduh_dlpd_btn = tb.Button(
+                file_frame,
+                text="⬇  Unduh DLPD",
+                command=self._unduh_dlpd,
+                bootstyle=INFO,
+                width=15,
+            )
+            self.unduh_dlpd_btn.pack(side=RIGHT, padx=(0, 8))
+        else:
+            self.unduh_dlpd_btn = None
 
         # Drag & drop hint
         if HAS_DND:
@@ -475,6 +511,8 @@ class App:
         self.path_entry.config(state="disabled" if running else NORMAL)
         if getattr(self, "db_check_btn", None) is not None:
             self.db_check_btn.config(state=state_run)
+        if getattr(self, "unduh_dlpd_btn", None) is not None:
+            self.unduh_dlpd_btn.config(state=state_run)
 
     # ── LOG SECTION ───────────────────────────────────────
 
@@ -958,6 +996,255 @@ class App:
         # Lepas thread pipeline
         self.billing_login_event.set()
 
+
+    # ── UNDUH FILE DLPD ───────────────────────────────────
+
+    def _unduh_dlpd(self):
+        """Buka dialog pilihan Kd Proses lalu unduh file input DLPD."""
+        if self.running:
+            return
+
+        year = self.year_var.get()
+        month = self.month_var.get()
+        if not year or not month:
+            messagebox.showwarning(
+                "Peringatan", "Pilih tahun dan bulan dulu sebelum unduh DLPD."
+            )
+            return
+
+        kd_proses = self._show_kd_proses_dialog()
+        if not kd_proses:
+            return
+
+        blth = year + month
+        self.stop = False
+        self.billing_login_event.clear()
+        self.billing_credentials_holder.cancel()
+        self._error_occurred = False
+        self._set_running(True)
+        self.progress_bar["value"] = 0
+        self.percent_label.config(text="0%")
+        self.status_label.config(text="Unduh file DLPD...", bootstyle=INFO)
+        self.eta_label.config(text="")
+
+        t = threading.Thread(
+            target=self._unduh_dlpd_thread, args=(blth, kd_proses), daemon=True
+        )
+        t.start()
+
+    def _unduh_dlpd_thread(self, blth, kd_proses):
+        # Pesan sendiri, bukan "done": handler "done" memunculkan
+        # "Proses analisa selesai!" yang keliru untuk pekerjaan unduh.
+        try:
+            stat = run_unduh_dlpd(
+                blth,
+                kd_proses,
+                progress_callback=self.queue.put,
+                stop_flag=lambda: self.stop,
+                billing_login_event=self.billing_login_event,
+                billing_credentials_holder=self.billing_credentials_holder,
+            )
+            self.queue.put(("unduh_dlpd_done", stat))
+        except Exception as e:
+            self.queue.put(("log", f"ERROR unduh DLPD: {e}"))
+            self.queue.put(("unduh_dlpd_done", None))
+
+    def _finish_unduh_dlpd(self, stat):
+        self._set_running(False)
+        self.eta_label.config(text="")
+
+        if stat is None:
+            self.status_label.config(text="Unduh DLPD gagal/dibatalkan", bootstyle=DANGER)
+            self.progress_bar["value"] = 0
+            self.percent_label.config(text="0%")
+            return
+
+        # Isi sendiri kolom File DPM - inti fitur ini memang menghapus langkah
+        # pilih-file manual yang rawan salah file/salah periode.
+        self.path_var.set(stat["path"])
+
+        self.progress_bar["value"] = 100
+        self.percent_label.config(text="100%")
+        self.status_label.config(text="File DLPD siap ✓", bootstyle=SUCCESS)
+
+        pesan = [
+            f"File tersimpan:\n{stat['path']}",
+            f"Baris DLPD   : {stat['n_dlpd']:,}",
+            f"Dapat kelainan_bc_meter: {stat['n_cocok']:,}",
+        ]
+        if stat["n_tak_cocok"]:
+            pesan.append(
+                f"Tanpa pasangan di DPM: {stat['n_tak_cocok']:,}\n"
+                f"(keterangan_dlpd-nya dibiarkan apa adanya)"
+            )
+        pesan.append("Kolom File DPM sudah terisi - tinggal tekan Jalankan.")
+        messagebox.showinfo("Unduh DLPD Selesai", "\n\n".join(pesan))
+
+    def _show_kd_proses_dialog(self):
+        """Dialog centang Kd Proses. Return list kode, atau None kalau batal."""
+        setelan = settings.load_unduh_settings()
+
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Pilih Kd Proses")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frm = tb.Frame(dialog, padding=20)
+        frm.pack(fill=BOTH, expand=True)
+
+        tb.Label(
+            frm, text="Kd Proses Kelompok", font=("Segoe UI", 13, "bold"),
+            bootstyle=PRIMARY,
+        ).pack(anchor=W, pady=(0, 4))
+
+        tb.Label(
+            frm,
+            text="Pilih kelompok proses yang mau diunduh. Pilihan ini dipakai "
+                 "untuk export DLPD maupun DPM.",
+            font=("Segoe UI", 9), bootstyle=SECONDARY, wraplength=420,
+        ).pack(anchor=W, pady=(0, 10))
+
+        kotak = tb.LabelFrame(frm, text="  Kode  ")
+        kotak.pack(fill=X, pady=(0, 10))
+        grid = tb.Frame(kotak, padding=8)
+        grid.pack(fill=X)
+
+        dipilih = set(setelan["kd_proses_dipilih"])
+        vars_kode = {}
+        for i, kode in enumerate(setelan["kd_proses_tersedia"]):
+            var = tk.BooleanVar(value=kode in dipilih)
+            vars_kode[kode] = var
+            tb.Checkbutton(grid, text=kode, variable=var, bootstyle="success-round-toggle").grid(
+                row=i // 4, column=i % 4, sticky=W, padx=6, pady=3
+            )
+
+        tb.Label(
+            frm, text="Daftar kode yang tersedia (pisahkan dengan koma)",
+            font=("Segoe UI", 9),
+        ).pack(anchor=W)
+        tersedia_var = tk.StringVar(value=", ".join(setelan["kd_proses_tersedia"]))
+        tb.Entry(frm, textvariable=tersedia_var, width=52).pack(fill=X, pady=(2, 2))
+        tb.Label(
+            frm,
+            text="Kode disimpan tanpa awalan unit. Awalannya (mis. 44BIM) "
+                 "ditempel otomatis dari unit tempat Anda login, jadi setelan "
+                 "ini tetap benar di unit mana pun.",
+            font=("Segoe UI", 8, "italic"), bootstyle=SECONDARY,
+            wraplength=420, justify=LEFT,
+        ).pack(anchor=W, pady=(0, 12))
+
+        hasil = {"kode": None}
+
+        def _simpan_daftar():
+            """Terapkan daftar kode yang diketik, bangun ulang centangnya."""
+            baru = [k.strip().upper() for k in tersedia_var.get().split(",") if k.strip()]
+            if not baru:
+                messagebox.showwarning(
+                    "Peringatan", "Daftar kode tidak boleh kosong.", parent=dialog
+                )
+                return
+            setelan["kd_proses_tersedia"] = baru
+            setelan["kd_proses_dipilih"] = [
+                k for k, v in vars_kode.items() if v.get() and k in baru
+            ]
+            settings.save_unduh_settings(setelan)
+            dialog.destroy()
+            # Buka ulang supaya centangnya mengikuti daftar yang baru.
+            hasil["kode"] = self._show_kd_proses_dialog()
+
+        def _ok():
+            kode = [k for k, v in vars_kode.items() if v.get()]
+            if not kode:
+                messagebox.showwarning(
+                    "Peringatan", "Pilih minimal satu Kd Proses.", parent=dialog
+                )
+                return
+            setelan["kd_proses_tersedia"] = [
+                k.strip().upper() for k in tersedia_var.get().split(",") if k.strip()
+            ] or setelan["kd_proses_tersedia"]
+            setelan["kd_proses_dipilih"] = kode
+            settings.save_unduh_settings(setelan)
+            hasil["kode"] = kode
+            dialog.destroy()
+
+        def _batal():
+            hasil["kode"] = None
+            dialog.destroy()
+
+        btn = tb.Frame(frm)
+        btn.pack(fill=X)
+        tb.Button(btn, text="Terapkan Daftar", command=_simpan_daftar,
+                  bootstyle=(INFO, OUTLINE), width=16).pack(side=LEFT)
+        tb.Button(btn, text="Unduh", command=_ok, bootstyle=SUCCESS,
+                  width=12).pack(side=RIGHT, padx=(8, 0))
+        tb.Button(btn, text="Batal", command=_batal, bootstyle=SECONDARY,
+                  width=12).pack(side=RIGHT)
+
+        dialog.bind("<Escape>", lambda e: _batal())
+        dialog.protocol("WM_DELETE_WINDOW", _batal)
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        dialog.wait_window()
+        return hasil["kode"]
+
+    # ── TENTANG ───────────────────────────────────────────
+
+    def _show_about_dialog(self):
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Tentang")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frm = tb.Frame(dialog, padding=24)
+        frm.pack(fill=BOTH, expand=True)
+
+        tb.Label(
+            frm, text="⚡ " + APP_NAMA, font=("Segoe UI", 15, "bold"),
+            bootstyle=PRIMARY,
+        ).pack(anchor=CENTER)
+
+        tb.Label(
+            frm, text=f"Versi {APP_VERSI}",
+            font=("Segoe UI", 9), bootstyle=SECONDARY,
+        ).pack(anchor=CENTER, pady=(2, 14))
+
+        tb.Label(
+            frm,
+            text="Deteksi anomali pemakaian listrik dari data DLPD:\n"
+                 "analisa stand & pemakaian, cek stan baca, validasi\n"
+                 "cabut/pasang, verifikasi foto meter, dan usulan koreksi.",
+            font=("Segoe UI", 9), justify=CENTER,
+        ).pack(anchor=CENTER, pady=(0, 16))
+
+        tb.Separator(frm).pack(fill=X, pady=(0, 12))
+
+        tb.Label(
+            frm, text=f"Dibuat di {APP_TEMPAT}, {APP_TAHUN}",
+            font=("Segoe UI", 10), justify=CENTER,
+        ).pack(anchor=CENTER)
+        tb.Label(
+            frm, text=APP_PEMBUAT, font=("Segoe UI", 12, "bold"),
+            bootstyle=INFO, justify=CENTER,
+        ).pack(anchor=CENTER, pady=(2, 16))
+
+        tb.Button(frm, text="Tutup", command=dialog.destroy,
+                  bootstyle=SECONDARY, width=12).pack(anchor=CENTER)
+
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        dialog.wait_window()
+
     # ── RULE SETTINGS DIALOG ──────────────────────────────
 
     def _show_rule_settings_dialog(self):
@@ -1391,6 +1678,9 @@ class App:
 
                 elif kind == "db_update_done":
                     self._finish_db_update(data)
+
+                elif kind == "unduh_dlpd_done":
+                    self._finish_unduh_dlpd(data)
 
                 elif kind == "verification_required":
                     self.status_label.config(text="Menunggu verifikasi database...", bootstyle=WARNING)

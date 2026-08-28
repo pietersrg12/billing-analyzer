@@ -7,7 +7,11 @@ beda, dan skema login-nya beda. Dua port dipakai:
 - POST {AUTH}/auth/login-v2
       -> bearer token + kode unit (unitupi/unitap/unitup)
 - POST {API}/api/monitoring/billing/monitoring-billing-detail-export
+- POST {API}/api/monitoring/billing/monitoring-dlpd-detail-export
+- POST {API}/api/monitoring-dpm-detail/export
       -> file .xlsx mentah (binary stream, bukan JSON)
+  Tiap export punya endpoint list pasangannya yang mengembalikan
+  `totalItems`, dipakai untuk mengisi `size` payload export.
 
 Soal `tokenInfo`: portal ini menuntut blob base64 384 byte yang dibuat
 generator milik masing-masing user. Blob itu TIDAK bisa dihitung dari
@@ -195,45 +199,99 @@ class BillingClient:
     # EXPORT
     # =========================
 
-    def download_billing_detail(self, thblrek, save_path, size, timeout=600):
-        """Unduh Monitoring_Billing_Detail satu periode ke `save_path`.
+    # Endpoint list dipakai untuk mengambil totalItems sebelum export: payload
+    # export menuntut `size` eksplisit, dan menebak angka besar berisiko ditolak
+    # server sekaligus menyembunyikan kalau ternyata datanya lebih banyak.
+    # BELUM terverifikasi dari capture (yang tertangkap hanya export-nya).
+    # Kalau path ini salah, hitung_total() balas None dan download_billing_detail
+    # memakai `size` cadangan dari pemanggil - jadi salah tebak di sini tidak
+    # menggagalkan unduhan, cuma kehilangan angka pastinya.
+    URL_LIST_BILLING = "/api/monitoring/billing/monitoring-billing-detil"
+    URL_LIST_DLPD = "/api/monitoring/billing/monitoring-billing-dlpd-detil"
+    URL_LIST_DPM = "/api/monitoring-dpm-detil"
 
-        Response-nya binary .xlsx (~5 MB), bukan JSON.
+    URL_EXPORT_BILLING = "/api/monitoring/billing/monitoring-billing-detail-export"
+    URL_EXPORT_DLPD = "/api/monitoring/billing/monitoring-dlpd-detail-export"
+    URL_EXPORT_DPM = "/api/monitoring-dpm-detail/export"
+
+    def kode_proses(self, kode_list):
+        """['T0','T1'] -> ['44BIMT0','44BIMT1'] memakai unitap hasil login.
+
+        Kode disimpan tanpa prefix unit supaya setelan yang sama bisa dipakai
+        unit mana pun; prefix-nya baru ditempel di sini.
         """
-        if not self.token:
+        if not self.unitap:
             raise BillingAuthError("Belum login ke portal billing")
+        return [f"{self.unitap}{str(k).strip().upper()}" for k in kode_list]
 
-        url = f"{self.api_url}/api/monitoring/billing/monitoring-billing-detail-export"
-        payload = {
-            "page": 0,
-            "size": int(size),
+    def _payload_unit(self, thblrek):
+        """Bagian payload yang sama di semua endpoint monitoring."""
+        return {
             "thblrek": str(thblrek),
             "unitap": self.unitap,
             "unitup": self.unitup,
             "unitupi": self.unitupi,
-            "idpel": "",
-            "postingbilling": "SEMUA",
-            "kdProsesKlp": ["SEMUA"],
-            "tipe": "excel",
         }
+
+    def hitung_total(self, path_list, payload, timeout=120):
+        """Jumlah baris (`totalItems`) untuk satu kombinasi filter.
+
+        Return None kalau tidak terbaca - caller memakai angka cadangan supaya
+        satu endpoint hitung yang rewel tidak menggagalkan seluruh unduhan.
+        """
+        if not self.token:
+            raise BillingAuthError("Belum login ke portal billing")
+
+        payload = dict(payload)
+        payload["page"] = 0
+        payload["size"] = 1
+
+        try:
+            resp = self.session.post(
+                f"{self.api_url}{path_list}", json=payload, timeout=timeout
+            )
+        except requests.RequestException:
+            return None
+
+        if resp.status_code == 401:
+            raise BillingAuthError("Token billing kedaluwarsa (HTTP 401)")
+        if resp.status_code != 200:
+            return None
+
+        try:
+            data = (resp.json().get("data") or {}).get("totalItems")
+        except ValueError:
+            return None
+
+        try:
+            total = int(data)
+        except (TypeError, ValueError):
+            return None
+        return total if total > 0 else None
+
+    def _unduh_export(self, path_export, payload, save_path, label, timeout=600):
+        """POST export lalu simpan .xlsx biner ke save_path. Return jumlah byte."""
+        if not self.token:
+            raise BillingAuthError("Belum login ke portal billing")
+
         # Header default session `accept: application/json` ditolak endpoint
-        # yang menghasilkan attachment (pola yang sama bikin download foto
-        # kena HTTP 406 di simba_client). Minta apa saja.
+        # yang menghasilkan attachment (pola yang sama bikin download foto kena
+        # HTTP 406 di simba_client). Minta apa saja.
         headers = {"accept": "*/*"}
 
         try:
             resp = self.session.post(
-                url, json=payload, headers=headers, stream=True, timeout=timeout
+                f"{self.api_url}{path_export}", json=payload,
+                headers=headers, stream=True, timeout=timeout,
             )
         except requests.RequestException as e:
-            raise BillingError(f"Gagal request export billing {thblrek}: {e}")
+            raise BillingError(f"Gagal request {label}: {e}")
 
         if resp.status_code == 401:
             raise BillingAuthError("Token billing kedaluwarsa (HTTP 401)")
         if resp.status_code != 200:
             raise BillingError(
-                f"Export billing {thblrek} gagal (HTTP {resp.status_code}): "
-                f"{resp.text[:200]}"
+                f"{label} gagal (HTTP {resp.status_code}): {resp.text[:200]}"
             )
 
         # Server bisa balas 200 dengan JSON error alih-alih file.
@@ -243,9 +301,7 @@ class BillingClient:
                 msg = resp.json().get("message", resp.text[:200])
             except ValueError:
                 msg = resp.text[:200]
-            raise BillingError(
-                f"Export billing {thblrek} tidak menghasilkan file: {msg}"
-            )
+            raise BillingError(f"{label} tidak menghasilkan file: {msg}")
 
         os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
         tmp_path = save_path + ".part"
@@ -258,18 +314,81 @@ class BillingClient:
                         total += len(chunk)
         except OSError as e:
             _silent_remove(tmp_path)
-            raise BillingError(f"Gagal menulis file export {thblrek}: {e}")
+            raise BillingError(f"Gagal menulis file {label}: {e}")
 
         # File xlsx terkecil sekalipun jauh di atas 1 KB; di bawah itu pasti
         # bukan workbook (biasanya body error yang lolos cek content-type).
         if total < 1024:
             _silent_remove(tmp_path)
-            raise BillingError(
-                f"Export billing {thblrek} balas file kosong ({total} byte)"
-            )
+            raise BillingError(f"{label} balas file kosong ({total} byte)")
 
         os.replace(tmp_path, save_path)
         return total
+
+    def download_billing_detail(self, thblrek, save_path, size, timeout=600):
+        """Unduh Monitoring_Billing_Detail satu periode (sumber database rekening)."""
+        payload = self._payload_unit(thblrek)
+        payload.update({
+            "page": 0,
+            "size": int(size),
+            "idpel": "",
+            "postingbilling": "SEMUA",
+            "kdProsesKlp": ["SEMUA"],
+            "tipe": "excel",
+        })
+        total = self.hitung_total(self.URL_LIST_BILLING, payload)
+        if total:
+            payload["size"] = total
+        return self._unduh_export(
+            self.URL_EXPORT_BILLING, payload, save_path,
+            f"export billing {thblrek}", timeout,
+        )
+
+    def download_dlpd_detail(self, thblrek, kode_list, save_path,
+                             dlpd="SEMUA", status_verifikasi="BELUM",
+                             size=None, timeout=600):
+        """Unduh Monitoring_Dlpd_Detail - file input utama aplikasi."""
+        payload = self._payload_unit(thblrek)
+        payload.update({
+            # `page` di endpoint ini bertipe STRING, sedangkan di DPM integer.
+            # Ditiru apa adanya dari capture; jangan diseragamkan tanpa diuji.
+            "page": "0",
+            "size": int(size) if size else 1,
+            "dlpd": dlpd,
+            "kdProsesKlp": self.kode_proses(kode_list),
+            "idpel": "",
+            "statusVerifikasiDlpd": status_verifikasi,
+            "dlpdKvarh": None,
+            "tipe": "excel",
+            "dlpdPlts": None,
+        })
+        if not size:
+            total = self.hitung_total(self.URL_LIST_DLPD, payload)
+            payload["size"] = total or 100000
+        return self._unduh_export(
+            self.URL_EXPORT_DLPD, payload, save_path,
+            f"export DLPD {thblrek}", timeout,
+        )
+
+    def download_dpm_detail(self, thblrek, kode_list, save_path,
+                            kodeposting="SUDAH", size=None, timeout=600):
+        """Unduh Monitoring_DPM_Detail - dipakai hanya untuk kelainan_bc_meter."""
+        payload = self._payload_unit(thblrek)
+        payload.update({
+            "page": 0,
+            "size": int(size) if size else 1,
+            "kodeposting": kodeposting,
+            "kdProsesKlp": self.kode_proses(kode_list),
+            "idpel": "",
+            "tipe": "excel",
+        })
+        if not size:
+            total = self.hitung_total(self.URL_LIST_DPM, payload)
+            payload["size"] = total or 100000
+        return self._unduh_export(
+            self.URL_EXPORT_DPM, payload, save_path,
+            f"export DPM {thblrek}", timeout,
+        )
 
 
 # =========================

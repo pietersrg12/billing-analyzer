@@ -68,3 +68,7 @@ download data base/
 # Keluaran presentasi (dibuat ulang oleh presentasi/siapkan_gambar.py + buat_ppt.py)
 presentasi/*.pptx
 presentasi/gambar/
+
+# Capture DLPD/DPM - bearer token hidup, jangan di-commit
+download dlpd/
+unduh_settings.json

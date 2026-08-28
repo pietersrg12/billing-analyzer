@@ -13,6 +13,7 @@ from core.cabut_pasang import (
     MASALAH_PASANG,
     MASALAH_SELISIH,
 )
+from core.loader import kelainan_meter
 from core.koreksi import (
     ALASAN_MAP,
     PILIHAN_BELUM_PDL,
@@ -283,7 +284,11 @@ def export_excel(df, output_file, bulan_list, klasifikasi=None, ocr_results=None
         "KWH METER TINGGI"
     ]
 
-    df_kel = df[df["KELAINAN"].isin(kel_filter)]
+    # Cocokkan ke segmen kelainan_bc_meter, bukan ke seluruh KELAINAN: nilai
+    # gabungannya "RUMAH KOSONG | K KWH NOL", yang tidak akan pernah sama
+    # dengan "RUMAH KOSONG" lewat isin(). Sebelum kolom gabungan ada, filter
+    # ini tidak pernah cocok sama sekali dan sheet-nya tidak pernah terbentuk.
+    df_kel = df[kelainan_meter(df["KELAINAN"]).isin(kel_filter)]
 
     if not df_kel.empty:
 

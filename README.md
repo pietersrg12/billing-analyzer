@@ -78,7 +78,7 @@ billing-analyzer/
 ## Format Input
 
 ### Format DPM "Resmi"
-Kolom yang diperlukan: `IDPEL`, `SAHLWBP`, `LWBPPAKAI`, `DAYA`, `TARIF`, `KELAINAN_BC_METER`
+Kolom yang diperlukan: `idpel`, `sahlwbp`, `pemkwh`, `daya`, `tarif`, `keterangan_dlpd` (lihat `REQUIRED_COLS` di `core/loader.py`). `kelainan_bc_meter` tidak ada di export DLPD - kolom itu diambil dari export DPM dan digabungkan oleh fitur Unduh DLPD
 
 ### Format DPM "Belum"
 Kolom yang diperlukan: `IDPEL`, `STAN_METER`, `PEMKWH`, `DAYA`, `TARIF`, `KDBACA`
