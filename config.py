@@ -4,8 +4,10 @@ Konfigurasi aplikasi PLN Billing Analyzer.
 Path resolution:
 - BUNDLE_DIR  : folder berisi resource read-only (database.xlsb, model/best.pt).
                 Saat dev = folder source. Saat di-bundle PyInstaller = sys._MEIPASS.
-- APP_DATA_DIR: folder writable per user (%LOCALAPPDATA%\\PLN-Billing).
-                Tempat menyimpan token SIMBA, foto cache, hasil Excel, log.
+- APP_DATA_DIR: folder writable per user (folder .exe kalau writable, kalau
+                tidak %LOCALAPPDATA%\\PLN-Billing).
+                Tempat menyimpan token SIMBA/billing, foto cache, hasil
+                Excel, database hasil update otomatis, dan log.
 """
 
 import os
@@ -32,17 +34,42 @@ def _bundle_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _is_writable(folder):
+    """True kalau folder benar-benar bisa ditulisi (bukan sekadar ada)."""
+    try:
+        os.makedirs(folder, exist_ok=True)
+        probe = os.path.join(folder, ".write_test")
+        with open(probe, "w") as f:
+            f.write("x")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
 def _app_data_dir():
     """Folder writable per user untuk simpan data runtime.
 
-    Windows: %LOCALAPPDATA%\\PLN-Billing
-    Fallback: ~/PLN-Billing (jika LOCALAPPDATA tidak ada)
-    Dev mode: folder source code (supaya pengembangan tidak kotor di AppData)
+    Dev mode: folder source code (supaya pengembangan tidak kotor di AppData).
+    Frozen  : folder .exe kalau masih writable (instalasi portable - perilaku
+              lama, supaya token/foto/hasil instalasi yang sudah ada tidak
+              tiba-tiba pindah tempat), kalau tidak jatuh ke
+              %LOCALAPPDATA%\\PLN-Billing.
+
+    Fallback ke LOCALAPPDATA ini wajib sejak app mulai MENULIS database
+    (fitur update database otomatis): build yang terpasang di Program Files
+    tidak boleh gagal cuma karena foldernya read-only.
     """
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    # Dev mode: pakai folder source agar tidak nyampur antara dev dan prod
-    return os.path.dirname(os.path.abspath(__file__))
+    if not getattr(sys, "frozen", False):
+        # Dev mode: pakai folder source agar tidak nyampur antara dev dan prod
+        return os.path.dirname(os.path.abspath(__file__))
+
+    exe_dir = os.path.dirname(sys.executable)
+    if _is_writable(exe_dir):
+        return exe_dir
+
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "PLN-Billing")
 
 
 def resource_path(*parts):
@@ -83,13 +110,69 @@ HASIL_DIR = user_path("hasil")
 # =========================
 # DATABASE
 # =========================
-DB_FILE = resource_path("database.xlsb")
+# Dua lokasi per database:
+# - BUNDLED (.xlsb) : resource read-only yang ikut di-ship, jadi seed awal.
+# - USER (.xlsx)    : hasil update otomatis, ditulis app, dipakai kalau ada.
+#
+# Sisi user WAJIB .xlsx: pyxlsb read-only, Python tidak bisa menulis .xlsb
+# sama sekali. Pembacanya (loader._read_excel_auto) sudah menangani kedua
+# ekstensi, jadi peralihan ini transparan buat pipeline.
+DB_FILE_BUNDLED = resource_path("database.xlsb")
+DB_FILE_USER = user_path("database.xlsx")
+
+STAN_BACA_DB_FILE_BUNDLED = resource_path("database_stand_baca.xlsb")
+STAN_BACA_DB_FILE_USER = user_path("database_stand_baca.xlsx")
+
+
+def db_path():
+    """Path database rekening yang berlaku sekarang.
+
+    Sengaja fungsi, bukan konstanta: setelah update database berhasil, file
+    user baru muncul di tengah sesi dan pipeline harus langsung memakainya
+    tanpa perlu restart aplikasi.
+    """
+    return DB_FILE_USER if os.path.exists(DB_FILE_USER) else DB_FILE_BUNDLED
+
+
+def stanbaca_db_path():
+    """Path database stan baca yang berlaku sekarang (lihat db_path())."""
+    if os.path.exists(STAN_BACA_DB_FILE_USER):
+        return STAN_BACA_DB_FILE_USER
+    return STAN_BACA_DB_FILE_BUNDLED
+
+
+# Alias lama: dipakai pln_billing.spec & selftest yang memang mengecek resource
+# bundled. Jangan dipakai untuk baca database saat runtime - pakai db_path().
+DB_FILE = DB_FILE_BUNDLED
 
 # =========================
 # STAN BACA (raw meter reading, sebelum potongan jam-nyala)
 # =========================
-STAN_BACA_DB_FILE = resource_path("database_stand_baca.xlsb")
-ENABLE_STAN_BACA = True   # auto-skip kalau file tidak ada di BUNDLE_DIR
+STAN_BACA_DB_FILE = STAN_BACA_DB_FILE_BUNDLED
+ENABLE_STAN_BACA = True   # auto-skip kalau file tidak ada
+
+# =========================
+# UPDATE DATABASE OTOMATIS
+# =========================
+# Portal billing = sumber database rekening. Host sama tapi PORT BEDA untuk
+# auth dan API (sesuai capture di folder "login/" dan "download data base/").
+BILLING_AUTH_URL = "http://10.68.35.109:8020"
+BILLING_API_URL = "http://10.68.35.109:7004"
+BILLING_TOKEN_FILE = user_path("billing_token.json")
+
+# Export billing minta `size` eksplisit (page 0 + size = ambil semua sekaligus).
+# Capture aslinya pakai 14663, yaitu jumlah baris persis; di sini dipakai angka
+# aman yang jauh di atas jumlah pelanggan satu ULP.
+BILLING_EXPORT_SIZE = 100000
+
+# Database stan baca ditarik per kategori kode baca, satu request masing-masing,
+# lalu digabung. Server tidak menyediakan opsi "SEMUA".
+KODE_BACA_KATEGORI = ("NORMAL", "GANGGUAN BACA", "GANGGUAN METER")
+
+ENABLE_DB_DOWNLOAD = True   # False = tombol "Cek Database" tidak ditampilkan
+
+UNDUHAN_DIR = user_path("unduhan")      # arsip file mentah hasil download
+DB_BACKUP_DIR = user_path("db_backup")  # salinan database sebelum ditimpa
 
 # =========================
 # RULE SETTINGS (threshold anomali, bisa diubah via UI)

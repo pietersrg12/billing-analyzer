@@ -5,11 +5,14 @@ Wraps:
 - POST /acmt/v1/auth/login         -> bearer token
 - POST /acmt/informasi/infopelanggan -> data + URL foto
 - GET <pathFoto URL>               -> binary image
+- POST /acmt/laporan/rekapkbtunggal/detail/download/excel
+                                   -> .xlsx dalam bungkus JSON base64
 
 Token cached to disk so user only logs in once per session lifetime
 (or until token expires).
 """
 
+import base64
 import json
 import os
 import requests
@@ -260,6 +263,70 @@ class SimbaClient:
             raise
         except requests.RequestException:
             return False
+
+    def download_kode_baca(self, blth, kdbaca, timeout=300):
+        """Unduh laporan Detail Kode Baca Tunggal satu kategori. Return bytes .xlsx.
+
+        Beda dari endpoint export lain: server TIDAK mengirim attachment, tapi
+        JSON {data: {filename, contentType, base64}} - jadi header default
+        session (accept: application/json) memang yang benar di sini, jangan
+        di-override seperti download_foto.
+
+        Kategori kdbaca ("NORMAL", "GANGGUAN BACA", "GANGGUAN METER") harus
+        ditarik satu per satu; server tidak menyediakan opsi "SEMUA". Ketiganya
+        mengembalikan `filename` yang identik, jadi caller yang menyimpan ke
+        disk wajib membedakan namanya sendiri.
+        """
+        if not self.unitup:
+            raise SimbaError("Belum login ke SIMBA")
+
+        url = f"{self.base_url}/acmt/laporan/rekapkbtunggal/detail/download/excel"
+        payload = {
+            "unitup": self.unitup,
+            "blth": str(blth),
+            "kodeRbm": "",
+            "kdbaca": kdbaca,
+            # transaksiBy pakai username LENGKAP ("44320.firdaus"), bukan
+            # self.unitup - beda dengan infopelanggan yang justru pakai unitup.
+            "transaksiBy": self.username,
+            "level": "1",
+        }
+
+        try:
+            resp = self.session.post(url, json=payload, timeout=timeout)
+        except requests.RequestException as e:
+            raise SimbaError(f"Gagal request kode baca {kdbaca} {blth}: {e}")
+
+        if resp.status_code == 401:
+            raise SimbaAuthError("Token expired saat download kode baca")
+        if resp.status_code != 200:
+            raise SimbaError(
+                f"Download kode baca {kdbaca} {blth} gagal "
+                f"(HTTP {resp.status_code}): {resp.text[:200]}"
+            )
+
+        try:
+            data = resp.json()
+        except ValueError:
+            raise SimbaError(f"Response kode baca {kdbaca} {blth} bukan JSON valid")
+
+        if not data.get("success"):
+            msg = str(data.get("message", "Unknown error"))
+            if any(k in msg.lower() for k in ("token", "auth", "login")):
+                raise SimbaAuthError(f"Auth gagal saat download kode baca: {msg}")
+            raise SimbaError(f"Download kode baca {kdbaca} {blth} gagal: {msg}")
+
+        b64 = (data.get("data") or {}).get("base64")
+        if not b64:
+            raise SimbaError(
+                f"Response kode baca {kdbaca} {blth} tidak memuat file "
+                f"(message: {data.get('message')})"
+            )
+
+        try:
+            return base64.b64decode(b64)
+        except (ValueError, TypeError) as e:
+            raise SimbaError(f"Base64 kode baca {kdbaca} {blth} rusak: {e}")
 
     # =========================
     # HELPERS
