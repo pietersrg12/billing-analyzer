@@ -104,8 +104,10 @@ def parse_billing_export(path, thblrek):
     else:
         out["DAYA"] = pd.NA
 
-    out = out.dropna(subset=["IDPEL", "STAND"])
-    out = out[out["IDPEL"].str.strip() != ""]
+    # astype(str) mengubah sel kosong jadi string "nan", bukan NaN, jadi
+    # dropna saja tidak cukup untuk membuang baris tanpa IDPEL.
+    out = out.dropna(subset=["STAND"])
+    out = out[out["IDPEL"].str.strip().ne("") & out["IDPEL"].str.lower().ne("nan")]
     if out.empty:
         raise DbUpdateError(f"Export billing {thblrek} tidak memuat baris data yang valid")
 
@@ -234,6 +236,12 @@ def append_rekening(df_baru):
     lama = _baca_db_lama(sumber)
 
     if lama is not None and not lama.empty:
+        kurang = [k for k in ("IDPEL", "BULAN") if k not in lama.columns]
+        if kurang:
+            raise DbUpdateError(
+                f"Database rekening lama ({os.path.basename(sumber)}) tidak punya "
+                f"kolom {', '.join(kurang)} - file ini bukan database rekening."
+            )
         lama = lama.copy()
         lama["IDPEL"] = lama["IDPEL"].astype(str).str.strip()
         lama["BULAN"] = pd.to_numeric(lama["BULAN"], errors="coerce").astype("int64")
@@ -299,6 +307,11 @@ def append_stanbaca(df_baru):
             if k not in lama.columns:
                 lama[k] = pd.NA
         lama = lama[KOLOM_STAN_BACA]
+        if lama["IDPEL"].isna().all():
+            raise DbUpdateError(
+                f"Database stan baca lama ({os.path.basename(sumber)}) tidak punya "
+                f"kolom IDPEL - file ini bukan database stan baca."
+            )
         lama["IDPEL"] = lama["IDPEL"].astype(str).str.strip()
         lama["TGL BACA"] = lama["TGL BACA"].astype(str).str.strip()
         n_lama = len(lama)

@@ -8,8 +8,13 @@ Flow:
 import os
 from datetime import datetime
 
+import pandas as pd
+
 from config import (
-    DB_FILE,
+    BILLING_API_URL,
+    BILLING_AUTH_URL,
+    BILLING_EXPORT_SIZE,
+    BILLING_TOKEN_FILE,
     DIGIT_MODEL_PATH,
     ENABLE_CLASSIFIER,
     ENABLE_DIGIT_READER,
@@ -21,9 +26,12 @@ from config import (
     MAX_WORKERS_DOWNLOAD,
     MAX_WORKERS_INFO,
     MODEL_PATH,
+    KODE_BACA_KATEGORI,
     SIMBA_BASE_URL,
     SIMBA_TOKEN_FILE,
-    STAN_BACA_DB_FILE,
+    UNDUHAN_DIR,
+    db_path,
+    stanbaca_db_path,
 )
 from core import settings, verification
 from core.analyzer import (
@@ -35,7 +43,14 @@ from core.cabut_pasang import compute_cabut_pasang, ringkasan as ringkasan_cabut
 from core.classifier import classify_all, is_available as classifier_available
 from core.excel import export_excel, format_excel
 from core.koreksi import tambah_saran_koreksi
-from core.loader import load_data, load_stanbaca_data
+from core.billing_client import BillingAuthError, BillingClient
+from core.db_updater import (
+    append_rekening,
+    append_stanbaca,
+    parse_billing_export,
+    parse_kode_baca_export,
+)
+from core.loader import _read_excel_auto, load_data, load_stanbaca_data
 from core.photo import download_photos
 from core.reader import is_available as reader_available
 from core.reader import read_meter_batch
@@ -45,7 +60,14 @@ from core.simba_client import SimbaAuthError, SimbaClient, SimbaError
 def _get_simba_client(
     df_anomali, blth, progress_callback, login_event, credentials_holder
 ):
-    """Setup SIMBA client. Reuse cached token kalau valid, kalau tidak minta login GUI."""
+    """Setup SIMBA client. Reuse cached token kalau valid, kalau tidak minta login GUI.
+
+    `df_anomali` boleh None (dipakai update database, yang jalan tanpa DPM
+    dimuat). Tanpa DPM tidak ada IDPEL untuk memprobe token, jadi token
+    tersimpan langsung dipakai dan biar request aslinya yang melempar
+    SimbaAuthError kalau ternyata sudah kedaluwarsa - caller menangkapnya,
+    menghapus token, lalu meminta login ulang.
+    """
 
     def log(msg):
         if progress_callback:
@@ -59,10 +81,14 @@ def _get_simba_client(
 
         # Probe pakai IDPEL pertama dari data anomali (atau df asal kalau kosong)
         probe_idpel = None
-        if not df_anomali.empty:
+        if df_anomali is not None and not df_anomali.empty:
             probe_idpel = str(df_anomali["IDPEL"].iloc[0])
 
-        if probe_idpel and client.probe(probe_idpel, blth):
+        if probe_idpel is None:
+            log("Token dipakai tanpa probe (tidak ada IDPEL untuk diuji)")
+            return client
+
+        if client.probe(probe_idpel, blth):
             log("Token valid")
             return client
 
@@ -124,11 +150,11 @@ def run_pipeline(
 
     # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ LOAD Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     log("LOAD DATA")
-    dpm, db = load_data(dpm_path, DB_FILE)
+    dpm, db = load_data(dpm_path, db_path())
 
     stanbaca_db = None
     if ENABLE_STAN_BACA:
-        stanbaca_db = load_stanbaca_data(STAN_BACA_DB_FILE)
+        stanbaca_db = load_stanbaca_data(stanbaca_db_path())
         if stanbaca_db is None:
             log("Database stan baca tidak ditemukan/tidak valid - dilewati")
         else:
@@ -442,3 +468,285 @@ def run_pipeline(
     percent(100)
 
     log(f"SELESAI -> {output_file}")
+
+
+# =========================
+# UPDATE DATABASE OTOMATIS
+# =========================
+
+def run_db_check(blth, progress_callback=None):
+    """Cek kelengkapan kedua database untuk analisis periode `blth`.
+
+    Aturannya sama dengan verifikasi yang jalan di dalam pipeline: minimal
+    `jumlah_bulan_rata2` bulan SEBELUM blth harus ada. Bedanya di sini tidak
+    ada daftar IDPEL untuk dicek per pelanggan - tombol ini dipakai sebelum
+    file DPM dipilih, jadi yang dilaporkan cuma bulan yang hilang db-wide.
+    """
+
+    def log(msg):
+        if progress_callback:
+            progress_callback(("log", msg))
+
+    cfg = settings.load_rules()
+    n_bulan = cfg["jumlah_bulan_rata2"]
+
+    log(f"Cek database untuk periode {blth} (butuh {n_bulan} bulan ke belakang)")
+
+    db = None
+    try:
+        terbaca = _read_excel_auto(db_path())
+        terbaca["BULAN"] = terbaca["BULAN"].astype(int)
+        db = terbaca
+        log(f"Database rekening: {len(db):,} baris ({os.path.basename(db_path())})")
+    except Exception as e:
+        # db sengaja dibiarkan None: DataFrame setengah jadi (mis. tanpa kolom
+        # BULAN) akan meledak di check_coverage, jauh dari sumber masalahnya.
+        log(f"Database rekening tidak terbaca: {e}")
+
+    stanbaca_db = None
+    if ENABLE_STAN_BACA:
+        stanbaca_db = load_stanbaca_data(stanbaca_db_path())
+        if stanbaca_db is None:
+            log("Database stan baca tidak ditemukan/tidak valid")
+        else:
+            log(f"Database stan baca: {len(stanbaca_db):,} baris")
+
+    cov_rekening = verification.check_coverage(db, blth, n_bulan)
+    cov_stanbaca = (
+        verification.check_coverage(stanbaca_db, blth, n_bulan)
+        if ENABLE_STAN_BACA else None
+    )
+
+    # Jumlah baris per bulan. check_coverage menganggap sebuah bulan "ada"
+    # begitu ada SATU baris saja, jadi bulan yang tarikannya gagal separuh
+    # bisa lolos sebagai lengkap. Hitungan ini ditampilkan di dialog supaya
+    # bulan yang isinya tipis kelihatan dan bisa ditarik ulang manual.
+    if cov_rekening:
+        cov_rekening["jumlah_per_bulan"] = _hitung_per_bulan(db, cov_rekening)
+    if cov_stanbaca:
+        cov_stanbaca["jumlah_per_bulan"] = _hitung_per_bulan(stanbaca_db, cov_stanbaca)
+
+    return {
+        "blth": blth,
+        "n_bulan": n_bulan,
+        "rekening": cov_rekening,
+        "stanbaca": cov_stanbaca,
+    }
+
+
+def _hitung_per_bulan(df, cov):
+    """{bulan: jumlah_baris} untuk bulan-bulan yang diverifikasi."""
+    if df is None or df.empty:
+        return {}
+    hitung = df["BULAN"].astype(int).value_counts()
+    return {b: int(hitung.get(int(b), 0)) for b in cov.get("bulan_list", [])}
+
+
+def _get_billing_client(progress_callback, login_event, credentials_holder):
+    """Setup client portal billing. Reuse token tersimpan, kalau tidak minta login GUI."""
+
+    def log(msg):
+        if progress_callback:
+            progress_callback(("log", msg))
+
+    client = BillingClient(BILLING_AUTH_URL, BILLING_API_URL)
+
+    if client.load_token(BILLING_TOKEN_FILE):
+        log(f"Coba pakai token billing tersimpan ({client.username})...")
+        if client.probe():
+            log("Token billing masih berlaku")
+            return client
+        log("Token billing kedaluwarsa, perlu login ulang")
+
+    if login_event is None or credentials_holder is None:
+        raise BillingAuthError(
+            "Tidak ada mekanisme login billing (login_event/credentials_holder None)"
+        )
+
+    if progress_callback:
+        progress_callback(("billing_login_required", None))
+
+    login_event.wait()
+    login_event.clear()
+
+    creds = credentials_holder.get()
+    if not creds:
+        raise BillingAuthError("Login billing dibatalkan oleh user")
+
+    username = creds.get("username", "").strip()
+    password = creds.get("password", "")
+    token_info = (creds.get("token_info") or "").strip()
+
+    if not username or not password:
+        raise BillingAuthError("Username/password billing kosong")
+    if not token_info:
+        raise BillingAuthError("Kode enkripsi billing kosong")
+
+    log(f"Login ke portal billing sebagai {username}...")
+    client.login(username, password, token_info)
+    client.save_token(BILLING_TOKEN_FILE)
+    log(f"Login billing berhasil ({client.nama} - unit {client.unitup})")
+
+    return client
+
+
+def _unduh_rekening(bulan_list, progress_callback, stop_flag,
+                    billing_login_event, billing_credentials_holder):
+    """Unduh + parse export billing untuk tiap bulan. Return DataFrame gabungan."""
+
+    def log(msg):
+        if progress_callback:
+            progress_callback(("log", msg))
+
+    client = _get_billing_client(
+        progress_callback, billing_login_event, billing_credentials_holder
+    )
+
+    os.makedirs(UNDUHAN_DIR, exist_ok=True)
+    frames = []
+    for bulan in bulan_list:
+        if stop_flag and stop_flag():
+            log("Dibatalkan")
+            return None
+
+        save_path = os.path.join(UNDUHAN_DIR, f"Monitoring_Billing_Detail_{bulan}.xlsx")
+        log(f"Unduh database rekening {bulan}...")
+        size = client.download_billing_detail(bulan, save_path, BILLING_EXPORT_SIZE)
+        log(f"  file diterima {size / 1048576:.1f} MB")
+
+        df = parse_billing_export(save_path, bulan)
+        log(f"  terparsing {len(df):,} baris")
+        frames.append(df)
+
+    return pd.concat(frames, ignore_index=True) if frames else None
+
+
+def _unduh_stanbaca(bulan_list, progress_callback, stop_flag,
+                    login_event, credentials_holder):
+    """Unduh + parse laporan kode baca (3 kategori/bulan). Return DataFrame gabungan."""
+
+    def log(msg):
+        if progress_callback:
+            progress_callback(("log", msg))
+
+    client = _get_simba_client(
+        None, bulan_list[0], progress_callback, login_event, credentials_holder
+    )
+
+    frames = []
+    for bulan in bulan_list:
+        if stop_flag and stop_flag():
+            log("Dibatalkan")
+            return None
+
+        log(f"Unduh database stan baca {bulan}...")
+        n_bulan_ini = 0
+        for kdbaca in KODE_BACA_KATEGORI:
+            if stop_flag and stop_flag():
+                log("Dibatalkan")
+                return None
+            raw = client.download_kode_baca(bulan, kdbaca)
+            df = parse_kode_baca_export(raw, kdbaca)
+            n_bulan_ini += len(df)
+            log(f"  {kdbaca}: {len(df):,} baris")
+            if not df.empty:
+                frames.append(df)
+        log(f"  total {bulan}: {n_bulan_ini:,} baris")
+
+    return pd.concat(frames, ignore_index=True) if frames else None
+
+
+def run_db_update(
+    bulan_rekening,
+    bulan_stanbaca,
+    progress_callback=None,
+    stop_flag=None,
+    login_event=None,
+    credentials_holder=None,
+    billing_login_event=None,
+    billing_credentials_holder=None,
+):
+    """Unduh bulan-bulan yang hilang lalu tulis ke database.
+
+    `bulan_rekening` / `bulan_stanbaca` = list "YYYYMM" (boleh kosong).
+    Penulisan database dilakukan SEKALI di akhir per database, bukan per bulan:
+    satu file berisi ratusan ribu baris dan penulisannya puluhan detik.
+    """
+
+    def log(msg):
+        if progress_callback:
+            progress_callback(("log", msg))
+
+    def percent(p):
+        if progress_callback:
+            progress_callback(("percent", p))
+
+    hasil = {"rekening": None, "stanbaca": None}
+    percent(0)
+
+    # ----- REKENING -----
+    if bulan_rekening:
+        log(f"=== DATABASE REKENING: {len(bulan_rekening)} bulan ===")
+        try:
+            df = _unduh_rekening(
+                bulan_rekening, progress_callback, stop_flag,
+                billing_login_event, billing_credentials_holder,
+            )
+        except BillingAuthError:
+            # Token ditolak server: buang supaya run berikutnya minta login lagi.
+            _hapus_token(BILLING_TOKEN_FILE)
+            raise
+        if df is None:
+            return hasil
+        percent(40)
+        log(f"Tulis database rekening ({len(df):,} baris baru diunduh)...")
+        hasil["rekening"] = append_rekening(df)
+        _log_statistik(log, "Database rekening", hasil["rekening"])
+    percent(50)
+
+    if stop_flag and stop_flag():
+        log("Dibatalkan")
+        return hasil
+
+    # ----- STAN BACA -----
+    if bulan_stanbaca:
+        log(f"=== DATABASE STAN BACA: {len(bulan_stanbaca)} bulan ===")
+        try:
+            df = _unduh_stanbaca(
+                bulan_stanbaca, progress_callback, stop_flag,
+                login_event, credentials_holder,
+            )
+        except SimbaAuthError:
+            _hapus_token(SIMBA_TOKEN_FILE)
+            raise
+        if df is None:
+            return hasil
+        percent(85)
+        log(f"Tulis database stan baca ({len(df):,} baris baru diunduh)...")
+        hasil["stanbaca"] = append_stanbaca(df)
+        _log_statistik(log, "Database stan baca", hasil["stanbaca"])
+
+    percent(100)
+    log("UPDATE DATABASE SELESAI")
+    return hasil
+
+
+def _log_statistik(log, judul, stat):
+    if not stat:
+        return
+    n_lama = stat["n_lama"]
+    n_total = stat["n_total"]
+    n_baru = stat["n_baru"]
+    n_unduh = stat["n_diunduh"]
+    log(f"{judul}: {n_lama:,} -> {n_total:,} baris (+{n_baru:,} baru dari {n_unduh:,} diunduh)")
+    log(f"  disimpan: {stat['path']}")
+    if stat.get("backup"):
+        log(f"  backup  : {stat['backup']}")
+
+
+def _hapus_token(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass

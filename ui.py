@@ -16,9 +16,9 @@ except ImportError:
     HAS_DND = False
 
 from core.loader import read_blth
-from core.pipeline import run_pipeline
+from core.pipeline import run_db_check, run_db_update, run_pipeline
 from core import settings
-from config import THEME_DARK, THEME_LIGHT
+from config import ENABLE_DB_DOWNLOAD, THEME_DARK, THEME_LIGHT
 
 
 class CredentialsHolder:
@@ -28,9 +28,15 @@ class CredentialsHolder:
         self._lock = threading.Lock()
         self._creds = None
 
-    def set(self, username, password):
+    def set(self, username, password, token_info=None):
+        """`token_info` hanya dipakai portal billing (kode enkripsi yang
+        di-paste user). Pemanggil SIMBA tetap cukup dua argumen."""
         with self._lock:
-            self._creds = {"username": username, "password": password}
+            self._creds = {
+                "username": username,
+                "password": password,
+                "token_info": token_info,
+            }
 
     def cancel(self):
         with self._lock:
@@ -137,6 +143,10 @@ class App:
         self.credentials_holder = CredentialsHolder()
         self.verify_event = threading.Event()
         self.verify_holder = VerificationResultHolder()
+        # Portal billing punya jalur login sendiri: host, token, dan skema
+        # kredensialnya beda dari SIMBA, jadi tidak bisa berbagi event.
+        self.billing_login_event = threading.Event()
+        self.billing_credentials_holder = CredentialsHolder()
 
         self._build_header()
         self._build_input_section()
@@ -183,6 +193,18 @@ class App:
             width=18,
         )
         self.rule_settings_btn.pack(side=RIGHT, padx=(5, 0))
+
+        if ENABLE_DB_DOWNLOAD:
+            self.db_check_btn = tb.Button(
+                btn_frame,
+                text="🗄 Cek Database",
+                bootstyle=(SUCCESS, OUTLINE),
+                command=self._check_database,
+                width=16,
+            )
+            self.db_check_btn.pack(side=RIGHT, padx=(5, 0))
+        else:
+            self.db_check_btn = None
 
     def _toggle_theme(self):
         style = tb.Style()
@@ -451,6 +473,8 @@ class App:
         self.year_cb.config(state="disabled" if running else "readonly")
         self.month_cb.config(state="disabled" if running else "readonly")
         self.path_entry.config(state="disabled" if running else NORMAL)
+        if getattr(self, "db_check_btn", None) is not None:
+            self.db_check_btn.config(state=state_run)
 
     # ── LOG SECTION ───────────────────────────────────────
 
@@ -560,6 +584,379 @@ class App:
             self.queue.put(("error", str(e)))
 
         self.queue.put(("done", None))
+
+
+    # ── CEK & UPDATE DATABASE ─────────────────────────────
+
+    def _check_database(self):
+        """Cek kelengkapan database untuk periode yang dipilih."""
+        if self.running:
+            return
+
+        year = self.year_var.get()
+        month = self.month_var.get()
+        if not year or not month:
+            messagebox.showwarning(
+                "Peringatan", "Pilih tahun dan bulan dulu sebelum cek database."
+            )
+            return
+
+        blth = year + month
+        self._set_running(True)
+        self.status_label.config(text="Mengecek database...", bootstyle=INFO)
+        self._add_log(f"Cek kelengkapan database untuk periode {blth}", "info")
+
+        t = threading.Thread(target=self._check_db_thread, args=(blth,), daemon=True)
+        t.start()
+
+    def _check_db_thread(self, blth):
+        # Membaca database ratusan ribu baris makan beberapa detik - jangan
+        # sampai membekukan Tk. Hasilnya dikembalikan lewat queue seperti
+        # semua pesan pipeline lain.
+        try:
+            hasil = run_db_check(blth, progress_callback=self.queue.put)
+            self.queue.put(("db_check_result", hasil))
+        except Exception as e:
+            self.queue.put(("log", f"ERROR cek database: {e}"))
+            self.queue.put(("db_check_result", None))
+
+    def _show_db_check_dialog(self, payload):
+        """Ringkasan kelengkapan database. Opsi update hanya muncul kalau kurang."""
+        self._set_running(False)
+
+        if payload is None:
+            self.status_label.config(text="Cek database gagal", bootstyle=DANGER)
+            return
+
+        blth = payload.get("blth", "")
+        n_bulan = payload.get("n_bulan", 6)
+
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Cek Database")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frm = tb.Frame(dialog, padding=20)
+        frm.pack(fill=BOTH, expand=True)
+
+        tb.Label(
+            frm,
+            text="Kelengkapan Database",
+            font=("Segoe UI", 13, "bold"),
+            bootstyle=PRIMARY,
+        ).pack(anchor=W, pady=(0, 4))
+
+        tb.Label(
+            frm,
+            text=f"Untuk menganalisis periode {blth}, database wajib punya "
+                 f"{n_bulan} bulan sebelumnya.",
+            font=("Segoe UI", 9),
+            bootstyle=SECONDARY,
+            wraplength=470,
+        ).pack(anchor=W, pady=(0, 12))
+
+        def _render(title, cov):
+            box = tb.LabelFrame(frm, text=f"  {title}  ")
+            box.pack(fill=X, pady=(0, 10))
+            inner = tb.Frame(box, padding=8)
+            inner.pack(fill=X)
+
+            if cov is None:
+                tb.Label(
+                    inner, text="Fitur ini tidak diaktifkan.", bootstyle=SECONDARY
+                ).pack(anchor=W)
+                return
+
+            if not cov.get("available"):
+                tb.Label(
+                    inner,
+                    text="Database tidak ditemukan / kosong - semua bulan perlu diunduh.",
+                    bootstyle=DANGER,
+                ).pack(anchor=W)
+
+            missing = cov.get("missing_bulan") or []
+            if missing:
+                tb.Label(
+                    inner,
+                    text=f"⚠ Belum ada datanya: {', '.join(missing)}",
+                    font=("Segoe UI", 9, "bold"),
+                    bootstyle=DANGER,
+                    wraplength=450,
+                ).pack(anchor=W)
+            elif cov.get("available"):
+                tb.Label(
+                    inner,
+                    text=f"✓ Lengkap {n_bulan} bulan.",
+                    bootstyle=SUCCESS,
+                ).pack(anchor=W)
+
+            # Jumlah baris per bulan: check_coverage menganggap sebuah bulan
+            # "ada" walau isinya cuma satu baris, jadi bulan yang tarikannya
+            # gagal separuh cuma kelihatan dari angka ini.
+            jumlah = cov.get("jumlah_per_bulan") or {}
+            if jumlah:
+                teks = "   ".join(f"{b}: {n:,}" for b, n in jumlah.items())
+                tb.Label(
+                    inner,
+                    text=f"Baris per bulan - {teks}",
+                    font=("Segoe UI", 8),
+                    bootstyle=SECONDARY,
+                    wraplength=450,
+                    justify=LEFT,
+                ).pack(anchor=W, pady=(4, 0))
+
+        _render("Database Rekening", payload.get("rekening"))
+        _render("Database Stan Baca", payload.get("stanbaca"))
+
+        kurang_rek = list((payload.get("rekening") or {}).get("missing_bulan") or [])
+        kurang_sb = list((payload.get("stanbaca") or {}).get("missing_bulan") or [])
+        ada_kurang = bool(kurang_rek or kurang_sb)
+
+        if ada_kurang:
+            # Dirinci per database: satu bulan rekening dan satu bulan stan
+            # baca ditarik dari sistem yang berbeda, jadi angka gabungan malah
+            # menyesatkan.
+            rincian = []
+            if kurang_rek:
+                rincian.append(f"{len(kurang_rek)} bulan rekening (portal billing)")
+            if kurang_sb:
+                rincian.append(f"{len(kurang_sb)} bulan stan baca (SIMBA)")
+            tb.Label(
+                frm,
+                text="Tekan Update Database untuk mengunduh " + " dan ".join(rincian)
+                     + ". Anda akan diminta login ke sistem yang bersangkutan.",
+                font=("Segoe UI", 9),
+                bootstyle=WARNING,
+                wraplength=470,
+            ).pack(anchor=W, pady=(0, 8))
+
+        btn_frame = tb.Frame(frm)
+        btn_frame.pack(fill=X, pady=(4, 0))
+
+        def _tutup():
+            dialog.destroy()
+
+        def _update():
+            dialog.destroy()
+            self._start_db_update(kurang_rek, kurang_sb)
+
+        tb.Button(
+            btn_frame, text="Tutup", command=_tutup, bootstyle=SECONDARY, width=12
+        ).pack(side=RIGHT)
+
+        if ada_kurang:
+            tb.Button(
+                btn_frame,
+                text="⬇  Update Database",
+                command=_update,
+                bootstyle=SUCCESS,
+                width=20,
+            ).pack(side=RIGHT, padx=(0, 8))
+            self.status_label.config(text="Database belum lengkap", bootstyle=WARNING)
+        else:
+            self.status_label.config(text="Database lengkap ✓", bootstyle=SUCCESS)
+
+        dialog.protocol("WM_DELETE_WINDOW", _tutup)
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        dialog.wait_window()
+
+    def _start_db_update(self, bulan_rekening, bulan_stanbaca):
+        self.stop = False
+        self.billing_login_event.clear()
+        self.billing_credentials_holder.cancel()
+        self.login_event.clear()
+        self.credentials_holder.cancel()
+        self._error_occurred = False
+        self._set_running(True)
+        self.progress_bar["value"] = 0
+        self.percent_label.config(text="0%")
+        self.status_label.config(text="Update database...", bootstyle=INFO)
+        self.eta_label.config(text="")
+
+        t = threading.Thread(
+            target=self._db_update_thread,
+            args=(bulan_rekening, bulan_stanbaca),
+            daemon=True,
+        )
+        t.start()
+
+    def _db_update_thread(self, bulan_rekening, bulan_stanbaca):
+        # Sengaja TIDAK memakai pesan "done": handler-nya memunculkan
+        # "Proses analisa selesai!" yang keliru untuk pekerjaan unduh.
+        try:
+            hasil = run_db_update(
+                bulan_rekening,
+                bulan_stanbaca,
+                progress_callback=self.queue.put,
+                stop_flag=lambda: self.stop,
+                login_event=self.login_event,
+                credentials_holder=self.credentials_holder,
+                billing_login_event=self.billing_login_event,
+                billing_credentials_holder=self.billing_credentials_holder,
+            )
+            self.queue.put(("db_update_done", hasil))
+        except Exception as e:
+            self.queue.put(("log", f"ERROR update database: {e}"))
+            self.queue.put(("db_update_done", None))
+
+    def _finish_db_update(self, hasil):
+        self._set_running(False)
+        self.eta_label.config(text="")
+
+        if hasil is None:
+            self.status_label.config(text="Update database gagal", bootstyle=DANGER)
+            self.progress_bar["value"] = 0
+            self.percent_label.config(text="0%")
+            return
+
+        baris = []
+        for judul, kunci in (("Rekening", "rekening"), ("Stan baca", "stanbaca")):
+            stat = hasil.get(kunci)
+            if stat:
+                baris.append(
+                    f"{judul}: {stat['n_total']:,} baris "
+                    f"(+{stat['n_baru']:,} baru)\n{stat['path']}"
+                )
+
+        if not baris:
+            self.status_label.config(text="Update dibatalkan", bootstyle=WARNING)
+            return
+
+        self.progress_bar["value"] = 100
+        self.percent_label.config(text="100%")
+        self.status_label.config(text="Database diperbarui ✓", bootstyle=SUCCESS)
+        messagebox.showinfo("Update Database Selesai", "\n\n".join(baris))
+
+    # ── LOGIN PORTAL BILLING DIALOG ───────────────────────
+
+    def _show_billing_login_dialog(self):
+        """Dialog kredensial portal billing. Blocking sampai user submit/cancel."""
+
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Login Portal Billing")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frm = tb.Frame(dialog, padding=20)
+        frm.pack(fill=BOTH, expand=True)
+
+        tb.Label(
+            frm,
+            text="Login Portal Billing",
+            font=("Segoe UI", 13, "bold"),
+            bootstyle=PRIMARY,
+        ).pack(anchor=W, pady=(0, 4))
+
+        tb.Label(
+            frm,
+            text="Dipakai untuk mengunduh database rekening "
+                 "(Monitoring Billing Detail).",
+            font=("Segoe UI", 9),
+            bootstyle=SECONDARY,
+            wraplength=430,
+        ).pack(anchor=W, pady=(0, 12))
+
+        tb.Label(frm, text="Username (NIP)", font=("Segoe UI", 9)).pack(anchor=W)
+        username_var = tk.StringVar()
+        user_entry = tb.Entry(frm, textvariable=username_var, width=44)
+        user_entry.pack(fill=X, pady=(2, 2))
+        tb.Label(
+            frm,
+            text="NIP portal billing, mis. 9716018H2Y - beda dari username SIMBA.",
+            font=("Segoe UI", 8, "italic"),
+            bootstyle=SECONDARY,
+        ).pack(anchor=W, pady=(0, 8))
+
+        tb.Label(frm, text="Password", font=("Segoe UI", 9)).pack(anchor=W)
+        password_var = tk.StringVar()
+        pass_entry = tb.Entry(frm, textvariable=password_var, show="•", width=44)
+        pass_entry.pack(fill=X, pady=(2, 8))
+
+        kode_head = tb.Frame(frm)
+        kode_head.pack(fill=X)
+        tb.Label(kode_head, text="Kode Enkripsi", font=("Segoe UI", 9)).pack(side=LEFT)
+
+        kode_text = tk.Text(frm, height=4, width=44, wrap="char", font=("Consolas", 8))
+        kode_text.pack(fill=X, pady=(2, 2))
+
+        def _tempel():
+            try:
+                isi = self.root.clipboard_get()
+            except tk.TclError:
+                return
+            kode_text.delete("1.0", "end")
+            kode_text.insert("1.0", isi.strip())
+
+        tb.Button(
+            kode_head, text="Tempel", command=_tempel, bootstyle=(INFO, OUTLINE), width=9
+        ).pack(side=RIGHT)
+
+        tb.Label(
+            frm,
+            text="Tempel kode dari generator Anda. Kode ini dibuat ulang setiap "
+                 "kali login, jadi tidak disimpan aplikasi.",
+            font=("Segoe UI", 8, "italic"),
+            bootstyle=SECONDARY,
+            wraplength=430,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(0, 12))
+
+        result = {"submitted": False}
+
+        def submit():
+            u = username_var.get().strip()
+            p = password_var.get()
+            k = kode_text.get("1.0", "end").strip()
+            if not u or not p:
+                messagebox.showwarning(
+                    "Peringatan",
+                    "Username dan password tidak boleh kosong.",
+                    parent=dialog,
+                )
+                return
+            if not k:
+                messagebox.showwarning(
+                    "Peringatan", "Kode enkripsi tidak boleh kosong.", parent=dialog
+                )
+                return
+            self.billing_credentials_holder.set(u, p, k)
+            result["submitted"] = True
+            dialog.destroy()
+
+        def cancel():
+            self.billing_credentials_holder.cancel()
+            self.stop = True
+            dialog.destroy()
+
+        btn_frame = tb.Frame(frm)
+        btn_frame.pack(fill=X)
+        tb.Button(
+            btn_frame, text="Login", command=submit, bootstyle=SUCCESS, width=12
+        ).pack(side=RIGHT, padx=(8, 0))
+        tb.Button(
+            btn_frame, text="Batal", command=cancel, bootstyle=SECONDARY, width=12
+        ).pack(side=RIGHT)
+
+        dialog.bind("<Escape>", lambda e: cancel())
+        dialog.protocol("WM_DELETE_WINDOW", cancel)
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+        user_entry.focus_set()
+
+        dialog.wait_window()
+
+        # Lepas thread pipeline
+        self.billing_login_event.set()
 
     # ── RULE SETTINGS DIALOG ──────────────────────────────
 
@@ -982,6 +1379,18 @@ class App:
                 elif kind == "simba_login_required":
                     self.status_label.config(text="Menunggu login SIMBA...", bootstyle=WARNING)
                     self._show_simba_login_dialog()
+
+                elif kind == "billing_login_required":
+                    self.status_label.config(
+                        text="Menunggu login portal billing...", bootstyle=WARNING
+                    )
+                    self._show_billing_login_dialog()
+
+                elif kind == "db_check_result":
+                    self._show_db_check_dialog(data)
+
+                elif kind == "db_update_done":
+                    self._finish_db_update(data)
 
                 elif kind == "verification_required":
                     self.status_label.config(text="Menunggu verifikasi database...", bootstyle=WARNING)
