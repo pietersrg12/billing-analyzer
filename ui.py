@@ -78,6 +78,32 @@ class VerificationResultHolder:
             return bool(self._proceed)
 
 
+# Siklus billing: baca meter dilakukan di akhir bulan (median tanggal 26) dan
+# hasilnya menagih rekening bulan BERIKUTNYA. Jadi sejak tanggal 20 ke atas,
+# periode yang sedang dikerjakan orang billing sudah bulan depan - itulah yang
+# dipakai sebagai tebakan awal combobox periode.
+TANGGAL_GANTI_PERIODE = 20
+
+
+def periode_default(hari_ini=None):
+    """Tebakan periode (tahun, bulan) berdasarkan tanggal hari ini.
+
+    Tanggal 1-19  -> bulan berjalan.
+    Tanggal 20-31 -> bulan berikutnya (ikut pergantian tahun di Desember).
+
+    Cuma nilai awal combobox; user tetap bisa menggantinya, dan memilih file
+    DPM akan menimpanya dengan thblrek dari file itu (lihat _autofill_blth).
+    """
+    now = hari_ini or datetime.now()
+    tahun, bulan = now.year, now.month
+    if now.day >= TANGGAL_GANTI_PERIODE:
+        bulan += 1
+        if bulan > 12:
+            bulan = 1
+            tahun += 1
+    return str(tahun), f"{bulan:02d}"
+
+
 STEPS = ["Load", "Prepare", "Analyze", "Download", "Export"]
 
 STEP_THRESHOLDS = [0, 10, 20, 22, 85]
@@ -311,7 +337,6 @@ class App:
             bootstyle=INFO,
         )
         self.year_cb.pack(side=LEFT, padx=(0, 4))
-        self.year_cb.set("2025")
 
         tb.Label(period_frame, text="-", font=("Segoe UI", 10)).pack(
             side=LEFT, padx=(0, 4)
@@ -327,7 +352,22 @@ class App:
             bootstyle=INFO,
         )
         self.month_cb.pack(side=LEFT)
-        self.month_cb.set("01")
+
+        tahun_awal, bulan_awal = periode_default()
+        if tahun_awal in self.year_cb["values"]:
+            self.year_cb.set(tahun_awal)
+        else:
+            # Di luar rentang combobox (mis. aplikasi dipakai setelah 2031):
+            # jatuh ke tahun terakhir yang tersedia daripada membiarkan kosong.
+            self.year_cb.set(self.year_cb["values"][-1])
+        self.month_cb.set(bulan_awal)
+
+        tb.Label(
+            period_frame,
+            text="(tebakan dari tanggal hari ini)",
+            font=("Segoe UI", 8, "italic"),
+            bootstyle=SECONDARY,
+        ).pack(side=LEFT, padx=(8, 0))
 
     def _autofill_blth(self, path):
         """Baca thblrek dari file DPM, auto-fill combobox tahun & bulan."""
