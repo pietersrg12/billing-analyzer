@@ -29,6 +29,8 @@ model/
 # Artefak build
 build/
 dist/
+# Salinan teracak PyArmor - dibuat ulang tiap build oleh build.bat
+build_obf/
 
 # Dataset & hasil crop YOLO
 yolo_dataset/
