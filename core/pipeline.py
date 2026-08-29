@@ -90,6 +90,32 @@ def unit_dari_token():
     return None
 
 
+def _catat_unit_login(unit, sumber, log=None):
+    """Jadikan unit hasil login sebagai unit aktif.
+
+    Kalau berbeda dari unit yang tersimpan, itu dicatat - bukan diganti
+    diam-diam. Beda unit antara SIMBA dan portal billing adalah keanehan yang
+    patut dilihat orang, bukan diselesaikan tanpa jejak.
+    """
+    if not unit:
+        return
+    lama = settings.get_unit_aktif()
+    if lama and lama != unit:
+        if log:
+            log(f"Unit aktif berubah: {lama} -> {unit} (dari login {sumber})")
+    settings.set_unit_aktif(unit)
+
+
+def unit_aktif():
+    """Unit yang sedang dikerjakan, untuk jalur yang tidak punya file DPM.
+
+    Urutannya: setelan eksplisit -> token tersimpan -> None. Setelan menang
+    karena itu pilihan sadar user; token cuma sisa login terakhir yang bisa
+    saja milik orang lain di komputer yang sama.
+    """
+    return settings.get_unit_aktif() or unit_dari_token()
+
+
 def unit_untuk_dpm(dpm_path, log=None):
     """Unit yang berlaku untuk satu file DPM/DLPD.
 
@@ -172,6 +198,7 @@ def _get_simba_client(
     log(f"Login ke SIMBA sebagai {username}...")
     client.login(username, password)
     client.save_token(SIMBA_TOKEN_FILE)
+    _catat_unit_login(client.unitup, "SIMBA", log)
     log("Login SIMBA berhasil")
 
     return client
@@ -552,7 +579,7 @@ def run_db_check(blth, unitup=None, progress_callback=None):
     n_bulan = cfg["jumlah_bulan_rata2"]
 
     if not unitup:
-        unitup = unit_dari_token()
+        unitup = unit_aktif()
 
     log(f"Cek database untuk periode {blth} (butuh {n_bulan} bulan ke belakang)")
     log(f"Unit: {unitup or 'belum diketahui - login dulu lewat Update Database'}")
@@ -660,6 +687,7 @@ def _get_billing_client(progress_callback, login_event, credentials_holder,
     log(f"Login ke portal billing sebagai {username}...")
     client.login(username, password, token_info)
     client.save_token(BILLING_TOKEN_FILE)
+    _catat_unit_login(client.unitup, "portal billing", log)
     log(f"Login billing berhasil ({client.nama} - unit {client.unitup})")
 
     return client
@@ -707,8 +735,28 @@ def _sufiks_kode(kode_list):
     return "_" + "".join(str(k).strip().upper() for k in kode_list)
 
 
+def _pastikan_unit_cocok(client, unit_diharapkan, sumber):
+    """Tolak kalau unit login beda dari unit yang sedang dikerjakan.
+
+    Daftar bulan yang kurang dihitung untuk `unit_diharapkan`, tapi hasil
+    unduhan ditulis ke unit yang login. Kalau keduanya beda, yang ditarik adalah
+    bulan yang kurang di unit LAIN - database unit yang benar bisa tetap bolong
+    tanpa ada yang memberi tahu. Karena itu dihentikan sebelum menulis apa pun.
+    """
+    if not unit_diharapkan or not client.unitup:
+        return
+    if str(client.unitup) != str(unit_diharapkan):
+        raise DbUpdateError(
+            f"Anda login {sumber} sebagai unit {client.unitup}, tapi yang mau "
+            f"diperbarui database unit {unit_diharapkan}. Login sebagai "
+            f"{unit_diharapkan}, atau ganti unit aktif ke {client.unitup} lalu "
+            f"tekan Cek Database lagi."
+        )
+
+
 def _unduh_rekening(bulan_list, progress_callback, stop_flag,
-                    billing_login_event, billing_credentials_holder, unit=None):
+                    billing_login_event, billing_credentials_holder, unit=None,
+                    unit_diharapkan=None):
     """Unduh + parse export billing untuk tiap bulan. Return DataFrame gabungan."""
 
     def log(msg):
@@ -719,6 +767,7 @@ def _unduh_rekening(bulan_list, progress_callback, stop_flag,
 
     def kerja(client):
         del frames[:]
+        _pastikan_unit_cocok(client, unit_diharapkan, "portal billing")
         # Unit dicatat DI SINI, satu-satunya tempat ia diketahui pasti: client
         # yang benar-benar berhasil login. Pemanggil memakainya untuk memilih
         # file database tujuan.
@@ -750,7 +799,8 @@ def _unduh_rekening(bulan_list, progress_callback, stop_flag,
 
 
 def _unduh_stanbaca(bulan_list, progress_callback, stop_flag,
-                    login_event, credentials_holder, unit=None):
+                    login_event, credentials_holder, unit=None,
+                    unit_diharapkan=None):
     """Unduh + parse laporan kode baca (3 kategori/bulan). Return DataFrame gabungan."""
 
     def log(msg):
@@ -760,6 +810,7 @@ def _unduh_stanbaca(bulan_list, progress_callback, stop_flag,
     client = _get_simba_client(
         None, bulan_list[0], progress_callback, login_event, credentials_holder
     )
+    _pastikan_unit_cocok(client, unit_diharapkan, "SIMBA")
     if unit is not None:
         unit["unitup"] = client.unitup
 
@@ -789,6 +840,7 @@ def _unduh_stanbaca(bulan_list, progress_callback, stop_flag,
 def run_db_update(
     bulan_rekening,
     bulan_stanbaca,
+    unit_diharapkan=None,
     progress_callback=None,
     stop_flag=None,
     login_event=None,
@@ -811,6 +863,9 @@ def run_db_update(
         if progress_callback:
             progress_callback(("percent", p))
 
+    if unit_diharapkan:
+        log(f"Unit yang diperbarui: {unit_diharapkan}")
+
     hasil = {"rekening": None, "stanbaca": None}
     # Unit tiap sumber dicatat terpisah: rekening dari portal billing, stan baca
     # dari SIMBA. Keduanya biasanya sama, tapi jangan diasumsikan - kalau user
@@ -827,6 +882,7 @@ def run_db_update(
             df = _unduh_rekening(
                 bulan_rekening, progress_callback, stop_flag,
                 billing_login_event, billing_credentials_holder, unit_rek,
+                unit_diharapkan,
             )
         except BillingAuthError:
             # Token ditolak server: buang supaya run berikutnya minta login lagi.
@@ -850,7 +906,7 @@ def run_db_update(
         try:
             df = _unduh_stanbaca(
                 bulan_stanbaca, progress_callback, stop_flag,
-                login_event, credentials_holder, unit_sb,
+                login_event, credentials_holder, unit_sb, unit_diharapkan,
             )
         except SimbaAuthError:
             _hapus_token(SIMBA_TOKEN_FILE)

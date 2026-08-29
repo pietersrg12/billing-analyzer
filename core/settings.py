@@ -88,6 +88,11 @@ def reset_rules():
 # unitap datang dari response login - jadi setelan yang sama otomatis benar
 # di unit mana pun.
 DEFAULT_UNDUH = {
+    # Unit yang sedang dikerjakan. Dinyatakan eksplisit, bukan ditebak dari
+    # token: token bisa saja milik unit lain (folder disalin, satu komputer
+    # dipakai dua orang), dan tebakan yang salah membuat Cek Database
+    # melaporkan "lengkap" untuk database yang bukan miliknya.
+    "unit_aktif": "",
     "kd_proses_tersedia": ["T0", "T1", "T2", "T3", "T4", "T5",
                            "G0", "G1", "PJ", "AP", "KI"],
     "kd_proses_dipilih": ["T0", "T1", "T2"],
@@ -134,6 +139,19 @@ def load_unduh_settings():
     ]
 
     return setelan
+
+
+def set_unit_aktif(unit):
+    """Simpan unit yang sedang dikerjakan. Dipanggil setiap login berhasil."""
+    setelan = load_unduh_settings()
+    setelan["unit_aktif"] = str(unit or "").strip()
+    save_unduh_settings(setelan)
+    return setelan["unit_aktif"]
+
+
+def get_unit_aktif():
+    """Unit dari setelan, atau None kalau belum pernah ditetapkan."""
+    return load_unduh_settings().get("unit_aktif") or None
 
 
 def save_unduh_settings(setelan):

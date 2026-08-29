@@ -12,13 +12,23 @@ tidak bisa diacak sama sekali. Setelah dipecah, keduanya jauh di bawah batas.
 Kalau nanti menambah dialog baru, perhatikan batas itu.
 """
 
+import glob
+import os
+
 import tkinter as tk
 from tkinter import messagebox
 
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 
-from config import APP_NAMA, APP_PEMBUAT, APP_TAHUN, APP_TEMPAT, APP_VERSI
+from config import (
+    APP_DATA_DIR,
+    APP_NAMA,
+    APP_PEMBUAT,
+    APP_TAHUN,
+    APP_TEMPAT,
+    APP_VERSI,
+)
 from core import settings
 
 
@@ -83,6 +93,122 @@ RULE_FIELD_GROUPS = [
 
 class DialogMixin:
     """Kumpulan dialog modal. Di-mixin ke ui.App."""
+
+    # ── PILIH UNIT ────────────────────────────────────────
+
+    def _unit_terdeteksi(self):
+        """Kode unit yang databasenya sudah ada di folder data.
+
+        Dibaca dari NAMA file (database_44320.xlsx), bukan dari isinya - jauh
+        lebih murah daripada membuka file ratusan ribu baris hanya untuk
+        mengisi daftar pilihan.
+        """
+        pola = os.path.join(APP_DATA_DIR, "database_*.xls*")
+        unit = set()
+        for berkas in glob.glob(pola):
+            nama = os.path.splitext(os.path.basename(berkas))[0]
+            for awalan in ("database_stand_baca_", "database_"):
+                if nama.startswith(awalan):
+                    sisa = nama[len(awalan):]
+                    if sisa:
+                        unit.add(sisa)
+                    break
+        return sorted(unit)
+
+    def _show_unit_dialog(self):
+        """Dialog pilih unit aktif. Return kode unit, atau None kalau batal."""
+        sekarang = settings.get_unit_aktif() or ""
+
+        dialog = tb.Toplevel(self.root)
+        dialog.title("Unit Aktif")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        frm = tb.Frame(dialog, padding=20)
+        frm.pack(fill=BOTH, expand=True)
+
+        tb.Label(
+            frm, text="Unit Aktif", font=("Segoe UI", 13, "bold"), bootstyle=PRIMARY
+        ).pack(anchor=W, pady=(0, 4))
+
+        tb.Label(
+            frm,
+            text="Menentukan database mana yang dipakai dan diperbarui. Tiap unit "
+                 "punya databasenya sendiri, jadi salah unit membuat aplikasi "
+                 "melaporkan database milik orang lain.",
+            font=("Segoe UI", 9), bootstyle=SECONDARY, wraplength=420,
+        ).pack(anchor=W, pady=(0, 12))
+
+        tb.Label(frm, text="Kode unit (unitup)", font=("Segoe UI", 9)).pack(anchor=W)
+        unit_var = tk.StringVar(value=sekarang)
+        entry = tb.Entry(frm, textvariable=unit_var, width=44)
+        entry.pack(fill=X, pady=(2, 2))
+        tb.Label(
+            frm,
+            text="Mis. 44320. Terisi sendiri setiap kali Anda login, jadi biasanya "
+                 "tidak perlu diketik manual.",
+            font=("Segoe UI", 8, "italic"), bootstyle=SECONDARY, wraplength=420,
+        ).pack(anchor=W, pady=(0, 10))
+
+        terdeteksi = self._unit_terdeteksi()
+        if terdeteksi:
+            kotak = tb.LabelFrame(frm, text="  Database yang sudah ada  ")
+            kotak.pack(fill=X, pady=(0, 12))
+            isi = tb.Frame(kotak, padding=8)
+            isi.pack(fill=X)
+            for i, kode in enumerate(terdeteksi):
+                tb.Button(
+                    isi, text=kode, bootstyle=(INFO, OUTLINE), width=10,
+                    command=lambda k=kode: unit_var.set(k),
+                ).grid(row=i // 4, column=i % 4, padx=4, pady=3)
+        else:
+            tb.Label(
+                frm,
+                text="Belum ada database unit mana pun. Setelah login lewat "
+                     "Update Database, unit ini terisi sendiri.",
+                font=("Segoe UI", 9), bootstyle=WARNING, wraplength=420,
+            ).pack(anchor=W, pady=(0, 12))
+
+        hasil = {"unit": None}
+
+        def _simpan():
+            u = unit_var.get().strip().upper()
+            if not u:
+                messagebox.showwarning(
+                    "Peringatan", "Kode unit tidak boleh kosong.", parent=dialog
+                )
+                return
+            settings.set_unit_aktif(u)
+            hasil["unit"] = u
+            dialog.destroy()
+
+        def _batal():
+            hasil["unit"] = None
+            dialog.destroy()
+
+        btn = tb.Frame(frm)
+        btn.pack(fill=X)
+        tb.Button(btn, text="Simpan", command=_simpan, bootstyle=SUCCESS,
+                  width=12).pack(side=RIGHT, padx=(8, 0))
+        tb.Button(btn, text="Batal", command=_batal, bootstyle=SECONDARY,
+                  width=12).pack(side=RIGHT)
+
+        dialog.bind("<Return>", lambda e: _simpan())
+        dialog.bind("<Escape>", lambda e: _batal())
+        dialog.protocol("WM_DELETE_WINDOW", _batal)
+
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+        entry.focus_set()
+
+        dialog.wait_window()
+
+        if hasil["unit"]:
+            self._perbarui_label_unit(hasil["unit"])
+        return hasil["unit"]
 
     # ── RULE SETTINGS DIALOG ──────────────────────────────
 

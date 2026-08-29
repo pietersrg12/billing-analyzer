@@ -15,9 +15,10 @@ try:
 except ImportError:
     HAS_DND = False
 
-from core.loader import read_blth
+from core.loader import read_blth, read_unitup
 from core.pipeline import (
     run_db_check,
+    unit_aktif,
     run_db_update,
     run_pipeline,
     run_unduh_dlpd,
@@ -155,6 +156,8 @@ class App(DialogMixin):
         self._build_action_buttons()
         self._build_log_section()
 
+        self._perbarui_label_unit()
+
         self.root.after(100, self._process_queue)
 
     # ── HEADER ────────────────────────────────────────────
@@ -204,6 +207,18 @@ class App(DialogMixin):
         )
         self.about_btn.pack(side=RIGHT, padx=(5, 0))
 
+        # Unit ditampilkan permanen: salah unit berarti aplikasi memakai
+        # database milik orang lain, dan itu harus ketahuan SEBELUM menekan
+        # apa pun - bukan setelah analisis selesai.
+        self.unit_btn = tb.Button(
+            btn_frame,
+            text="Unit: -",
+            bootstyle=(SECONDARY, OUTLINE),
+            command=self._ganti_unit,
+            width=14,
+        )
+        self.unit_btn.pack(side=RIGHT, padx=(5, 0))
+
         if ENABLE_DB_DOWNLOAD:
             self.db_check_btn = tb.Button(
                 btn_frame,
@@ -215,6 +230,23 @@ class App(DialogMixin):
             self.db_check_btn.pack(side=RIGHT, padx=(5, 0))
         else:
             self.db_check_btn = None
+
+    def _perbarui_label_unit(self, unit=None):
+        """Segarkan tulisan tombol unit di header."""
+        if getattr(self, "unit_btn", None) is None:
+            return
+        unit = unit or unit_aktif()
+        if unit:
+            self.unit_btn.config(text=f"Unit: {unit}", bootstyle=(INFO, OUTLINE))
+        else:
+            self.unit_btn.config(
+                text="Unit: belum dipilih", bootstyle=(WARNING, OUTLINE)
+            )
+
+    def _ganti_unit(self):
+        if self.running:
+            return
+        self._show_unit_dialog()
 
     def _toggle_theme(self):
         style = tb.Style()
@@ -321,8 +353,42 @@ class App(DialogMixin):
         self.year_cb.set(tahun_awal)
         self.month_cb.set(bulan_awal)
 
+    def _periksa_unit_file(self, path):
+        """Samakan unit aktif dengan unit file DLPD yang baru dipilih.
+
+        File itu sendiri yang menentukan database mana yang dipakai saat
+        analisis, jadi unit aktif harus ikut - kalau tidak, tombol Cek Database
+        akan melaporkan unit yang berbeda dari yang sedang dikerjakan.
+        """
+        try:
+            unit_file = read_unitup(path)
+        except Exception:
+            unit_file = None
+        if not unit_file:
+            # File tanpa kolom unitup, atau memuat lebih dari satu unit (mis.
+            # export level UP3). Jangan menebak - biarkan unit aktif apa adanya.
+            self._add_log("File tidak menyatakan satu unit; unit aktif dibiarkan", "info")
+            return
+
+        lama = unit_aktif()
+        if lama == unit_file:
+            return
+
+        settings.set_unit_aktif(unit_file)
+        self._perbarui_label_unit(unit_file)
+        self._add_log(f"Unit aktif mengikuti file: {lama or '-'} -> {unit_file}", "info")
+        messagebox.showinfo(
+            "Unit berbeda",
+            f"File DLPD ini milik unit {unit_file}, sedangkan unit aktif "
+            f"sebelumnya {lama or 'belum dipilih'}.\n\n"
+            f"Unit aktif sudah diubah ke {unit_file}. Login sebagai unit "
+            f"{unit_file} lalu perbarui databasenya lewat Cek Database, supaya "
+            f"analisisnya memakai riwayat yang benar.",
+        )
+
     def _autofill_blth(self, path):
-        """Baca thblrek dari file DPM, auto-fill combobox tahun & bulan."""
+        """Baca thblrek + unitup dari file DPM, sesuaikan periode & unit."""
+        self._periksa_unit_file(path)
         try:
             blth = read_blth(path)
         except Exception:
@@ -505,6 +571,8 @@ class App(DialogMixin):
             self.db_check_btn.config(state=state_run)
         if getattr(self, "unduh_dlpd_btn", None) is not None:
             self.unduh_dlpd_btn.config(state=state_run)
+        if getattr(self, "unit_btn", None) is not None:
+            self.unit_btn.config(state=state_run)
 
     # ── LOG SECTION ───────────────────────────────────────
 
@@ -631,24 +699,32 @@ class App(DialogMixin):
             )
             return
 
+        # Unit harus jelas SEBELUM mengecek: tanpa itu laporannya bisa tentang
+        # database unit lain, dan salahnya baru ketahuan saat analisis.
+        unit = unit_aktif()
+        if not unit:
+            unit = self._show_unit_dialog()
+            if not unit:
+                self._add_log("Cek database dibatalkan - unit belum dipilih", "error")
+                return
+
         blth = year + month
         self._set_running(True)
         self.status_label.config(text="Mengecek database...", bootstyle=INFO)
-        self._add_log(f"Cek kelengkapan database untuk periode {blth}", "info")
+        self._add_log(f"Cek kelengkapan database untuk periode {blth} (unit {unit})", "info")
 
-        t = threading.Thread(target=self._check_db_thread, args=(blth,), daemon=True)
+        t = threading.Thread(
+            target=self._check_db_thread, args=(blth, unit), daemon=True
+        )
         t.start()
 
-    def _check_db_thread(self, blth):
+    def _check_db_thread(self, blth, unitup):
         # Membaca database ratusan ribu baris makan beberapa detik - jangan
         # sampai membekukan Tk. Hasilnya dikembalikan lewat queue seperti
         # semua pesan pipeline lain.
         try:
-            # unitup dibiarkan None: run_db_check yang mencarinya dari token
-            # tersimpan. Kalau belum ada token pun tidak apa-apa - database
-            # dianggap belum ada, semua bulan dilaporkan kurang, dan tombol
-            # Update Database muncul untuk memulai login.
-            hasil = run_db_check(blth, progress_callback=self.queue.put)
+            hasil = run_db_check(blth, unitup=unitup,
+                                 progress_callback=self.queue.put)
             self.queue.put(("db_check_result", hasil))
         except Exception as e:
             self.queue.put(("log", f"ERROR cek database: {e}"))
@@ -682,6 +758,7 @@ class App(DialogMixin):
             hasil = run_db_update(
                 bulan_rekening,
                 bulan_stanbaca,
+                unit_diharapkan=unit_aktif(),
                 progress_callback=self.queue.put,
                 stop_flag=lambda: self.stop,
                 login_event=self.login_event,
@@ -696,6 +773,8 @@ class App(DialogMixin):
 
     def _finish_db_update(self, hasil):
         self._set_running(False)
+        # Login di dalam proses update bisa menetapkan unit; segarkan labelnya.
+        self._perbarui_label_unit()
         self.eta_label.config(text="")
 
         if hasil is None:
@@ -845,6 +924,9 @@ class App(DialogMixin):
                         text="Menunggu login portal billing...", bootstyle=WARNING
                     )
                     self._show_billing_login_dialog()
+
+                elif kind == "unit_berubah":
+                    self._perbarui_label_unit(data)
 
                 elif kind == "db_check_result":
                     self._show_db_check_dialog(data)
