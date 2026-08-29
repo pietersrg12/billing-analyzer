@@ -260,6 +260,12 @@ class BillingClient:
         if resp.status_code == 401:
             raise BillingAuthError("Token billing kedaluwarsa (HTTP 401)")
         if resp.status_code != 200:
+            # Kegagalan auth harus naik ke atas, bukan jadi None: kalau ditelan,
+            # unduhan lanjut memakai size cadangan lalu gagal lagi di export
+            # dengan sebab yang sama.
+            pesan = _pesan_respons(resp)
+            if _pesan_auth(pesan):
+                raise BillingAuthError(f"{pesan} (HTTP {resp.status_code})")
             return None
 
         try:
@@ -294,18 +300,18 @@ class BillingClient:
         if resp.status_code == 401:
             raise BillingAuthError("Token billing kedaluwarsa (HTTP 401)")
         if resp.status_code != 200:
-            raise BillingError(
-                f"{label} gagal (HTTP {resp.status_code}): {resp.text[:200]}"
-            )
+            pesan = _pesan_respons(resp)
+            if _pesan_auth(pesan):
+                raise BillingAuthError(f"{pesan} (HTTP {resp.status_code})")
+            raise BillingError(f"{label} gagal (HTTP {resp.status_code}): {pesan}")
 
         # Server bisa balas 200 dengan JSON error alih-alih file.
         ctype = (resp.headers.get("content-type") or "").lower()
         if "json" in ctype:
-            try:
-                msg = resp.json().get("message", resp.text[:200])
-            except ValueError:
-                msg = resp.text[:200]
-            raise BillingError(f"{label} tidak menghasilkan file: {msg}")
+            pesan = _pesan_respons(resp)
+            if _pesan_auth(pesan):
+                raise BillingAuthError(pesan)
+            raise BillingError(f"{label} tidak menghasilkan file: {pesan}")
 
         os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
         tmp_path = save_path + ".part"
@@ -398,6 +404,32 @@ class BillingClient:
 # =========================
 # HELPERS
 # =========================
+
+# Portal ini menolak token basi dengan HTTP 500 + {"message": "Token tidak
+# sesuai"}, BUKAN 401. Mengandalkan kode status saja membuat kegagalan auth
+# terbaca sebagai error server biasa, sehingga user tidak pernah diminta login
+# ulang dan unduhannya mentok terus.
+PETUNJUK_AUTH = ("token", "auth", "login", "unauthor", "kedaluwarsa", "expired")
+
+
+def _pesan_auth(teks):
+    """True kalau body respons berbau masalah token/otentikasi."""
+    if not teks:
+        return False
+    rendah = str(teks).lower()
+    return any(k in rendah for k in PETUNJUK_AUTH)
+
+
+def _pesan_respons(resp):
+    """Ambil `message` dari body JSON; kalau bukan JSON, potongan teks mentah."""
+    try:
+        data = resp.json()
+    except ValueError:
+        return (resp.text or "")[:200]
+    if isinstance(data, dict):
+        return str(data.get("message") or data.get("error") or "")[:200]
+    return str(data)[:200]
+
 
 def _jwt_exp(token):
     """Ambil klaim `exp` dari JWT tanpa verifikasi tanda tangan.

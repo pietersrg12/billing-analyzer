@@ -328,7 +328,7 @@ class App:
         if HAS_DND:
             self.drop_label = tb.Label(
                 frame,
-                text="💡 Drop file DPM ke area ini",
+                text="💡 Unduh atau drop file DPM ke area ini",
                 font=("Segoe UI", 9, "italic"),
                 bootstyle=SECONDARY,
             )
@@ -377,13 +377,6 @@ class App:
         tahun_awal, bulan_awal = periode_default(sekarang)
         self.year_cb.set(tahun_awal)
         self.month_cb.set(bulan_awal)
-
-        tb.Label(
-            period_frame,
-            text="(tebakan dari tanggal hari ini)",
-            font=("Segoe UI", 8, "italic"),
-            bootstyle=SECONDARY,
-        ).pack(side=LEFT, padx=(8, 0))
 
     def _autofill_blth(self, path):
         """Baca thblrek dari file DPM, auto-fill combobox tahun & bulan."""
@@ -977,16 +970,20 @@ class App:
         kode_head.pack(fill=X)
         tb.Label(kode_head, text="Kode Enkripsi", font=("Segoe UI", 9)).pack(side=LEFT)
 
-        kode_text = tk.Text(frm, height=4, width=44, wrap="char", font=("Consolas", 8))
-        kode_text.pack(fill=X, pady=(2, 2))
+        # Entry, bukan Text: widget Text tidak punya opsi `show`, jadi isinya
+        # tidak bisa disamarkan. Kodenya panjang (±500 karakter) sehingga
+        # kotaknya menggulir mendatar - itu wajar dan tidak mengganggu karena
+        # isinya di-paste, bukan diketik.
+        kode_var = tk.StringVar()
+        kode_entry = tb.Entry(frm, textvariable=kode_var, show="*", width=44)
+        kode_entry.pack(fill=X, pady=(2, 2))
 
         def _tempel():
             try:
                 isi = self.root.clipboard_get()
             except tk.TclError:
                 return
-            kode_text.delete("1.0", "end")
-            kode_text.insert("1.0", isi.strip())
+            kode_var.set(isi.strip())
 
         tb.Button(
             kode_head, text="Tempel", command=_tempel, bootstyle=(INFO, OUTLINE), width=9
@@ -1007,7 +1004,7 @@ class App:
         def submit():
             u = username_var.get().strip()
             p = password_var.get()
-            k = kode_text.get("1.0", "end").strip()
+            k = kode_var.get().strip()
             if not u or not p:
                 messagebox.showwarning(
                     "Peringatan",

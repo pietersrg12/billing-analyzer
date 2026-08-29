@@ -544,8 +544,13 @@ def _hitung_per_bulan(df, cov):
     return {b: int(hitung.get(int(b), 0)) for b in cov.get("bulan_list", [])}
 
 
-def _get_billing_client(progress_callback, login_event, credentials_holder):
-    """Setup client portal billing. Reuse token tersimpan, kalau tidak minta login GUI."""
+def _get_billing_client(progress_callback, login_event, credentials_holder,
+                        paksa_login=False):
+    """Setup client portal billing. Reuse token tersimpan, kalau tidak minta login GUI.
+
+    `paksa_login=True` melewati token tersimpan - dipakai saat server sudah
+    menolak token itu, supaya tidak berputar memakai token yang sama.
+    """
 
     def log(msg):
         if progress_callback:
@@ -553,7 +558,7 @@ def _get_billing_client(progress_callback, login_event, credentials_holder):
 
     client = BillingClient(BILLING_AUTH_URL, BILLING_API_URL)
 
-    if client.load_token(BILLING_TOKEN_FILE):
+    if not paksa_login and client.load_token(BILLING_TOKEN_FILE):
         log(f"Coba pakai token billing tersimpan ({client.username})...")
         if client.probe():
             log("Token billing masih berlaku")
@@ -592,6 +597,48 @@ def _get_billing_client(progress_callback, login_event, credentials_holder):
     return client
 
 
+def _kerja_billing(kerja, progress_callback, login_event, credentials_holder):
+    """Jalankan kerja(client); kalau token ditolak server, login ulang lalu ulangi.
+
+    Token portal billing membawa klaim exp bertahun-tahun ke depan, jadi
+    probe() lokal bisa bilang "masih berlaku" padahal server sudah tidak
+    mengakuinya (mis. login dari tempat lain). Satu-satunya cara tahu adalah
+    request sungguhan gagal - jadi kegagalan itu yang dipakai sebagai pemicu
+    login ulang, bukan dibiarkan jadi error buntu.
+    """
+
+    def log(msg):
+        if progress_callback:
+            progress_callback(("log", msg))
+
+    client = _get_billing_client(progress_callback, login_event, credentials_holder)
+    try:
+        return kerja(client)
+    except BillingAuthError as e:
+        log(f"Token ditolak server: {e}")
+        _hapus_token(BILLING_TOKEN_FILE)
+        log("Minta login ulang untuk ambil token baru...")
+        client = _get_billing_client(
+            progress_callback, login_event, credentials_holder, paksa_login=True
+        )
+        # Gagal lagi setelah token baru berarti bukan soal token - biarkan naik.
+        return kerja(client)
+
+
+def _folder_unduhan(client, blth):
+    """unduhan/<unitup>/<blth>/ - dipisah per unit supaya file dari unit
+    berbeda tidak saling menimpa, dan per bulan supaya mudah ditelusuri."""
+    unit = str(client.unitup or "unit")
+    return os.path.join(UNDUHAN_DIR, unit, str(blth))
+
+
+def _sufiks_kode(kode_list):
+    """['T0','T1'] -> '_T0T1' untuk menandai cakupan file di namanya."""
+    if not kode_list:
+        return ""
+    return "_" + "".join(str(k).strip().upper() for k in kode_list)
+
+
 def _unduh_rekening(bulan_list, progress_callback, stop_flag,
                     billing_login_event, billing_credentials_holder):
     """Unduh + parse export billing untuk tiap bulan. Return DataFrame gabungan."""
@@ -600,26 +647,32 @@ def _unduh_rekening(bulan_list, progress_callback, stop_flag,
         if progress_callback:
             progress_callback(("log", msg))
 
-    client = _get_billing_client(
-        progress_callback, billing_login_event, billing_credentials_holder
-    )
-
-    os.makedirs(UNDUHAN_DIR, exist_ok=True)
     frames = []
-    for bulan in bulan_list:
-        if stop_flag and stop_flag():
-            log("Dibatalkan")
-            return None
 
-        save_path = os.path.join(UNDUHAN_DIR, f"Monitoring_Billing_Detail_{bulan}.xlsx")
-        log(f"Unduh database rekening {bulan}...")
-        size = client.download_billing_detail(bulan, save_path, BILLING_EXPORT_SIZE)
-        log(f"  file diterima {size / 1048576:.1f} MB")
+    def kerja(client):
+        del frames[:]
+        for bulan in bulan_list:
+            if stop_flag and stop_flag():
+                log("Dibatalkan")
+                return None
 
-        df = parse_billing_export(save_path, bulan)
-        log(f"  terparsing {len(df):,} baris")
-        frames.append(df)
+            folder = _folder_unduhan(client, bulan)
+            os.makedirs(folder, exist_ok=True)
+            save_path = os.path.join(folder, f"Monitoring_Billing_Detail_{bulan}.xlsx")
+            log(f"Unduh database rekening {bulan}...")
+            size = client.download_billing_detail(bulan, save_path, BILLING_EXPORT_SIZE)
+            log(f"  file diterima {size / 1048576:.1f} MB")
 
+            df = parse_billing_export(save_path, bulan)
+            log(f"  terparsing {len(df):,} baris")
+            frames.append(df)
+        return True
+
+    hasil = _kerja_billing(
+        kerja, progress_callback, billing_login_event, billing_credentials_holder
+    )
+    if hasil is None:
+        return None
     return pd.concat(frames, ignore_index=True) if frames else None
 
 
@@ -787,23 +840,30 @@ def run_unduh_dlpd(
     log(f"=== UNDUH FILE DLPD {blth} ===")
     log(f"Kd Proses: {', '.join(kd_proses)}")
 
-    try:
-        client = _get_billing_client(
-            progress_callback, billing_login_event, billing_credentials_holder
-        )
+    jalur = {}
 
+    def kerja(client):
+        """Unduh kedua export. Dipisah jadi fungsi supaya bisa diulang utuh
+        setelah login ulang - token baru berarti seluruh rangkaian request
+        harus dijalankan lagi, bukan disambung di tengah."""
         if stop_flag and stop_flag():
             log("Dibatalkan")
             return None
 
-        os.makedirs(UNDUHAN_DIR, exist_ok=True)
-        path_dlpd = os.path.join(UNDUHAN_DIR, f"Monitoring_Dlpd_Detail_{blth}.xlsx")
-        path_dpm = os.path.join(UNDUHAN_DIR, f"Monitoring_DPM_Detail_{blth}.xlsx")
+        folder = _folder_unduhan(client, blth)
+        os.makedirs(folder, exist_ok=True)
+        sufiks = _sufiks_kode(kd_proses)
+        jalur["dlpd"] = os.path.join(
+            folder, f"Monitoring_Dlpd_Detail_{blth}{sufiks}.xlsx")
+        jalur["dpm"] = os.path.join(
+            folder, f"Monitoring_DPM_Detail_{blth}{sufiks}.xlsx")
+        jalur["keluar"] = os.path.join(
+            folder, f"DLPD_{blth}{sufiks}_gabungan.xlsx")
 
         log(f"Unduh export DLPD {blth} (unit {client.unitap}/{client.unitup})...")
         percent(10)
         n = client.download_dlpd_detail(
-            blth, kd_proses, path_dlpd,
+            blth, kd_proses, jalur["dlpd"],
             dlpd=setelan["dlpd"],
             status_verifikasi=setelan["status_verifikasi_dlpd"],
         )
@@ -819,23 +879,23 @@ def run_unduh_dlpd(
         # pasti tidak cocok bukan karena datanya memang tidak ada.
         log(f"Unduh export DPM {blth} (untuk kolom kelainan_bc_meter)...")
         n = client.download_dpm_detail(
-            blth, kd_proses, path_dpm,
+            blth, kd_proses, jalur["dpm"],
             kodeposting=setelan["kodeposting_dpm"],
         )
         log(f"  file DPM diterima {n / 1048576:.1f} MB")
         percent(70)
+        return True
 
-    except BillingAuthError:
-        _hapus_token(BILLING_TOKEN_FILE)
-        raise
+    if _kerja_billing(kerja, progress_callback,
+                      billing_login_event, billing_credentials_holder) is None:
+        return None
 
     if stop_flag and stop_flag():
         log("Dibatalkan")
         return None
 
-    path_keluar = os.path.join(UNDUHAN_DIR, f"DLPD_{blth}_gabungan.xlsx")
     log("Gabungkan kelainan_bc_meter ke keterangan_dlpd...")
-    stat = gabung_dlpd_dpm(path_dlpd, path_dpm, path_keluar)
+    stat = gabung_dlpd_dpm(jalur["dlpd"], jalur["dpm"], jalur["keluar"])
 
     log(f"  DLPD {stat['n_dlpd']:,} baris, DPM {stat['n_dpm']:,} baris")
     log(f"  {stat['n_cocok']:,} baris dapat kelainan_bc_meter")
@@ -847,7 +907,7 @@ def run_unduh_dlpd(
         # filter kodeposting-nya yang perlu diperiksa.
         log(f"  {stat['n_tak_cocok']:,} baris tanpa pasangan di DPM "
             f"- keterangan_dlpd-nya dibiarkan apa adanya")
-    log(f"File siap dipakai: {path_keluar}")
+    log(f"File siap dipakai: {jalur['keluar']}")
     percent(100)
 
     return stat
