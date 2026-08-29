@@ -1,12 +1,12 @@
 ; ============================================================
-; PLN Billing Analyzer v1.0 - Inno Setup script
+; PLN Billing Analyzer v2.1 - Inno Setup script
 ; ============================================================
 ; Compile: iscc installer.iss
-; Output : Output\PLN-Billing-Setup-v1.0.exe
+; Output : Output\PLN-Billing-Setup-v2.1.exe
 ; ============================================================
 
 #define AppName     "PLN Billing Analyzer"
-#define AppVersion  "1.0"
+#define AppVersion  "2.1"
 #define AppPublisher "PLN"
 #define AppExeName  "PLN-Billing.exe"
 

@@ -79,7 +79,7 @@ def reset_rules():
 # SETELAN UNDUHAN DLPD
 # =========================
 # Disimpan TERPISAH dari DEFAULT_RULES, bukan digabung. Dialog Pengaturan Rule
-# memanggil float() atas setiap key-nya dan ui.RULE_FIELD_GROUPS wajib sinkron
+# memanggil float() atas setiap key-nya dan ui_dialogs.RULE_FIELD_GROUPS wajib sinkron
 # persis dengan DEFAULT_RULES - satu key bertipe list di sana langsung bikin
 # dialognya gagal dibuka.
 #

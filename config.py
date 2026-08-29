@@ -205,7 +205,7 @@ DIGIT_MODEL_PATH = resource_path("model", "digit_detector.pt")
 # =========================
 # Dikumpulkan di sini supaya teks kredit tidak tercecer di banyak tempat.
 APP_NAMA = "PLN Billing Analyzer"
-APP_VERSI = "2.0"
+APP_VERSI = "2.1"
 APP_TEMPAT = "Dompu"
 APP_TAHUN = "2026"
 APP_PEMBUAT = "PMPS"
