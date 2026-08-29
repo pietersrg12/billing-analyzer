@@ -92,6 +92,40 @@ def read_blth(dpm_path):
         return None
 
 
+# Skema database historis. Dipakai juga saat databasenya belum ada, supaya
+# pipeline tetap jalan dengan DataFrame kosong berkolom benar.
+KOLOM_DB = ["IDPEL", "BULAN", "STAND", "PEMAKAIAN", "DAYA", "KEY"]
+
+
+def read_unitup(dpm_path):
+    """Ambil unitup dari file DPM/DLPD - penentu database unit mana yang dipakai.
+
+    File itu sendiri yang menyatakan miliknya siapa, jadi ini sumber paling
+    otoritatif saat analisis (lebih tepat daripada unit token, yang bisa saja
+    milik user lain di komputer yang sama).
+
+    Return string unitup, atau None kalau kolomnya tidak ada ATAU memuat lebih
+    dari satu unit. Nilai None disengaja untuk kasus banyak unit (mis. export
+    milik user level UP3): lebih baik jatuh ke unit token sambil mencatat di
+    log daripada diam-diam menebak satu unit dan menulis ke database yang salah.
+    """
+    try:
+        df = pd.read_excel(dpm_path, usecols=["unitup"])
+    except Exception:
+        return None
+    nilai = df["unitup"].dropna().astype(str).str.strip()
+    nilai = nilai[nilai.ne("")]
+    unik = nilai.unique()
+    if len(unik) != 1:
+        return None
+    return str(unik[0])
+
+
+def db_kosong():
+    """DataFrame database kosong berkolom lengkap (dipakai saat belum diunduh)."""
+    return pd.DataFrame({k: pd.Series(dtype="object") for k in KOLOM_DB})
+
+
 def load_data(dpm_path, db_path):
     """Load DPM + database, lakukan mapping & cleaning.
 
@@ -100,11 +134,19 @@ def load_data(dpm_path, db_path):
     dpm : DataFrame dengan kolom IDPEL, STAND_KINI, PEMAKAIAN, DAYA, TARIF,
           KELAINAN, plus STAND_AWAL/STAND_CABUT/STAND_PASANG bila tersedia
           di file (lihat COL_MAP_OPSIONAL)
-    db  : DataFrame database historis (IDPEL, BULAN, STAND, PEMAKAIAN, DAYA, KEY)
+    db  : DataFrame database historis (IDPEL, BULAN, STAND, PEMAKAIAN, DAYA,
+          KEY). Kosong kalau `db_path` None atau filenya belum ada.
     """
 
     dpm = _read_excel_auto(dpm_path)
-    db = _read_excel_auto(db_path)
+
+    # Database belum ada bukan kondisi error: instalasi baru memang belum
+    # mengunduh apa pun. Hasilnya semua baris jadi DATA BARU, dan dialog
+    # verifikasi coverage sudah memperingatkan lebih dulu.
+    if db_path and os.path.exists(db_path):
+        db = _read_excel_auto(db_path)
+    else:
+        db = db_kosong()
 
     # =========================
     # VALIDASI FORMAT

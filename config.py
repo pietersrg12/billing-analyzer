@@ -110,46 +110,59 @@ HASIL_DIR = user_path("hasil")
 # =========================
 # DATABASE
 # =========================
-# Dua lokasi per database:
-# - BUNDLED (.xlsb) : resource read-only yang ikut di-ship, jadi seed awal.
-# - USER (.xlsx)    : hasil update otomatis, ditulis app, dipakai kalau ada.
+# Database dipisah PER UNIT: database_44320.xlsx, database_44210.xlsx, dst.
 #
-# Sisi user WAJIB .xlsx: pyxlsb read-only, Python tidak bisa menulis .xlsb
-# sama sekali. Pembacanya (loader._read_excel_auto) sudah menangani kedua
-# ekstensi, jadi peralihan ini transparan buat pipeline.
-DB_FILE_BUNDLED = resource_path("database.xlsb")
-DB_FILE_USER = user_path("database.xlsx")
+# Bukan sekadar kerapian. Isinya cuma IDPEL tanpa kolom unit, dan check_coverage
+# hanya memeriksa BULAN - jadi satu file bersama membuat database unit lain
+# terbaca sebagai "sudah lengkap", tombol Update tidak pernah muncul, dan
+# analisisnya menjadikan semua pelanggan "DATA BARU" tanpa gejala apa pun.
+# Nama file yang membawa kode unit membuat salah pasang jadi mustahil.
+#
+# Ekstensi .xlsx karena pyxlsb read-only (tidak ada pustaka Python yang bisa
+# MENULIS .xlsb); .xlsb tetap dibaca supaya file lama yang di-rename ikut jalan.
+DB_PREFIX = "database"
+STAN_BACA_PREFIX = "database_stand_baca"
 
-STAN_BACA_DB_FILE_BUNDLED = resource_path("database_stand_baca.xlsb")
-STAN_BACA_DB_FILE_USER = user_path("database_stand_baca.xlsx")
 
+def _cari_db(prefix, unitup):
+    """Path database unit tsb. Return None kalau belum ada.
 
-def db_path():
-    """Path database rekening yang berlaku sekarang.
-
-    Sengaja fungsi, bukan konstanta: setelah update database berhasil, file
-    user baru muncul di tengah sesi dan pipeline harus langsung memakainya
-    tanpa perlu restart aplikasi.
+    Sengaja TIDAK pernah jatuh ke nama tanpa akhiran unit: justru itu yang bisa
+    memasangkan data satu unit ke unit lain tanpa ketahuan.
     """
-    return DB_FILE_USER if os.path.exists(DB_FILE_USER) else DB_FILE_BUNDLED
+    if not unitup:
+        return None
+    for ext in (".xlsx", ".xlsb"):
+        p = user_path(f"{prefix}_{unitup}{ext}")
+        if os.path.exists(p):
+            return p
+    return None
 
 
-def stanbaca_db_path():
-    """Path database stan baca yang berlaku sekarang (lihat db_path())."""
-    if os.path.exists(STAN_BACA_DB_FILE_USER):
-        return STAN_BACA_DB_FILE_USER
-    return STAN_BACA_DB_FILE_BUNDLED
+def db_path(unitup):
+    """Database rekening milik unit tsb, atau None kalau belum diunduh."""
+    return _cari_db(DB_PREFIX, unitup)
 
 
-# Alias lama: dipakai pln_billing.spec & selftest yang memang mengecek resource
-# bundled. Jangan dipakai untuk baca database saat runtime - pakai db_path().
-DB_FILE = DB_FILE_BUNDLED
+def stanbaca_db_path(unitup):
+    """Database stan baca milik unit tsb, atau None kalau belum diunduh."""
+    return _cari_db(STAN_BACA_PREFIX, unitup)
+
+
+def db_path_baru(unitup):
+    """Path tujuan penulisan database rekening unit tsb (selalu .xlsx)."""
+    return user_path(f"{DB_PREFIX}_{unitup}.xlsx")
+
+
+def stanbaca_db_path_baru(unitup):
+    """Path tujuan penulisan database stan baca unit tsb (selalu .xlsx)."""
+    return user_path(f"{STAN_BACA_PREFIX}_{unitup}.xlsx")
+
 
 # =========================
 # STAN BACA (raw meter reading, sebelum potongan jam-nyala)
 # =========================
-STAN_BACA_DB_FILE = STAN_BACA_DB_FILE_BUNDLED
-ENABLE_STAN_BACA = True   # auto-skip kalau file tidak ada
+ENABLE_STAN_BACA = True   # auto-skip kalau file unit tsb belum ada
 
 # =========================
 # UPDATE DATABASE OTOMATIS

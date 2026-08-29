@@ -26,10 +26,10 @@ import pandas as pd
 
 from config import (
     DB_BACKUP_DIR,
-    DB_FILE_USER,
-    STAN_BACA_DB_FILE_USER,
     db_path,
+    db_path_baru,
     stanbaca_db_path,
+    stanbaca_db_path_baru,
 )
 from core.loader import _read_excel_auto
 
@@ -274,12 +274,20 @@ def _baca_db_lama(path):
         return None
 
 
-def append_rekening(df_baru):
-    """Gabungkan baris baru ke database rekening. Return dict statistik."""
+def append_rekening(df_baru, unitup):
+    """Gabungkan baris baru ke database rekening UNIT tsb. Return dict statistik.
+
+    `unitup` menentukan file tujuan. Wajib: tanpa itu, data unit berbeda bisa
+    menyatu di satu file tanpa penanda apa pun - database ini tidak punya kolom
+    unit, jadi percampurannya tidak akan pernah ketahuan.
+    """
     if df_baru is None or df_baru.empty:
         raise DbUpdateError("Tidak ada baris rekening untuk ditambahkan")
+    if not unitup:
+        raise DbUpdateError("Unit tidak diketahui - database tidak bisa ditulis")
 
-    sumber = db_path()
+    sumber = db_path(unitup)
+    tujuan = db_path_baru(unitup)
     lama = _baca_db_lama(sumber)
 
     if lama is not None and not lama.empty:
@@ -310,11 +318,12 @@ def append_rekening(df_baru):
     gabung = gabung.drop_duplicates(subset=["KEY"], keep="last")
     gabung = gabung.sort_values(["BULAN", "IDPEL"]).reset_index(drop=True)
 
-    backup = _backup(sumber) if os.path.exists(sumber) else None
-    _tulis_xlsx(gabung, DB_FILE_USER)
+    backup = _backup(sumber) if sumber and os.path.exists(sumber) else None
+    _tulis_xlsx(gabung, tujuan)
 
     return {
-        "path": DB_FILE_USER,
+        "path": tujuan,
+        "unitup": unitup,
         "backup": backup,
         "n_lama": n_lama,
         "n_diunduh": len(df_baru),
@@ -336,12 +345,15 @@ def _bulan_rekening(seri_bulan_baca):
     return (tgl + pd.DateOffset(months=1)).dt.strftime("%Y%m")
 
 
-def append_stanbaca(df_baru):
-    """Gabungkan baris baru ke database stan baca. Return dict statistik."""
+def append_stanbaca(df_baru, unitup):
+    """Gabungkan baris baru ke database stan baca UNIT tsb. Return dict statistik."""
     if df_baru is None or df_baru.empty:
         raise DbUpdateError("Tidak ada baris stan baca untuk ditambahkan")
+    if not unitup:
+        raise DbUpdateError("Unit tidak diketahui - database tidak bisa ditulis")
 
-    sumber = stanbaca_db_path()
+    sumber = stanbaca_db_path(unitup)
+    tujuan = stanbaca_db_path_baru(unitup)
     lama = _baca_db_lama(sumber)
 
     if lama is not None and not lama.empty:
@@ -380,11 +392,12 @@ def append_stanbaca(df_baru):
     bulan = sorted(_bulan_rekening(gabung["_BLN"]).unique().tolist())
     gabung = gabung.drop(columns=["_BLN"]).reset_index(drop=True)
 
-    backup = _backup(sumber) if os.path.exists(sumber) else None
-    _tulis_xlsx(gabung, STAN_BACA_DB_FILE_USER)
+    backup = _backup(sumber) if sumber and os.path.exists(sumber) else None
+    _tulis_xlsx(gabung, tujuan)
 
     return {
-        "path": STAN_BACA_DB_FILE_USER,
+        "path": tujuan,
+        "unitup": unitup,
         "backup": backup,
         "n_lama": n_lama,
         "n_diunduh": len(df_baru),

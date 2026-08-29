@@ -16,7 +16,8 @@ mati saat dijalankan.
 Notes:
 - ultralytics & torch butuh collect_all karena banyak dynamic import + data file.
 - pyxlsb, openpyxl, ttkbootstrap, tkinterdnd2 perlu data file collection.
-- database.xlsb & model/best.pt di-bundle sebagai datas.
+- model/best.pt di-bundle sebagai datas; database TIDAK (per unit,
+  diunduh sendiri oleh tiap unit).
 - Excludes: matplotlib, scipy, jupyter, dst untuk hemat ukuran.
 """
 
@@ -75,20 +76,17 @@ binaries += collect_dynamic_libs("numpy")
 # APP RESOURCES
 # =========================
 
+# Database TIDAK di-bundle. Isinya data pelanggan satu unit, dan menyertakannya
+# berarti mengirim data itu ke setiap unit yang dikirimi installer - sekaligus
+# menanam "seed" yang membuat unit lain dilaporkan sudah lengkap padahal
+# databasenya milik orang lain. Tiap unit mengunduh datanya sendiri lewat
+# tombol Cek Database.
 datas += [
-    ("database.xlsb", "."),
     ("model/best.pt", "model"),
     ("model/digit_detector.pt", "model"),
     ("model/display_detector.pt", "model"),
     ("assets/icon.ico", "assets"),
 ]
-
-# database_stand_baca.xlsb bersifat opsional (ENABLE_STAN_BACA di config.py
-# di-skip gracefully kalau file tidak ada saat runtime) - bundle hanya kalau
-# sudah disediakan di root project supaya build tidak gagal saat file belum ada.
-import os as _os
-if _os.path.exists("database_stand_baca.xlsb"):
-    datas += [("database_stand_baca.xlsb", ".")]
 
 # =========================
 # HIDDEN IMPORTS (defensive)

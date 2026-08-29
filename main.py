@@ -95,12 +95,14 @@ def _selftest(argv):
     jadi stdout tidak kelihatan saat dijalankan user.
     """
     from config import BUNDLE_DIR, MODEL_PATH, db_path, stanbaca_db_path
+    from core.pipeline import unit_dari_token
 
-    # Pakai resolver, bukan konstanta bundled: setelah update database
-    # otomatis, file yang benar-benar dibaca pipeline adalah .xlsx milik
-    # user - itulah yang perlu diverifikasi selftest.
-    DB_FILE = db_path()
-    STAN_BACA_DB_FILE = stanbaca_db_path()
+    # Database dipisah per unit dan TIDAK ikut di-bundle, jadi unitnya diambil
+    # dari token tersimpan. Instalasi baru memang belum punya database sama
+    # sekali - itu keadaan normal, bukan kerusakan.
+    UNIT = unit_dari_token()
+    DB_FILE = db_path(UNIT)
+    STAN_BACA_DB_FILE = stanbaca_db_path(UNIT)
 
     baris = []
     gagal = []
@@ -150,19 +152,28 @@ def _selftest(argv):
             raise FileNotFoundError(p)
         return f"{os.path.getsize(p):,} byte"
 
-    for nama, path in ((os.path.basename(DB_FILE), DB_FILE),
-                       (os.path.basename(STAN_BACA_DB_FILE), STAN_BACA_DB_FILE),
-                       ("model/best.pt", MODEL_PATH)):
-        cek(nama, lambda p=path: ukuran(p))
+    tulis(f"  unit aktif (dari token): {UNIT or 'belum login'}")
 
-    def baca_db():
-        # Engine mengikuti ekstensi: .xlsb butuh pyxlsb, .xlsx hasil update
-        # dibaca openpyxl.
-        from core.loader import _read_excel_auto
-        df = _read_excel_auto(DB_FILE).head(5)
-        return f"terbaca, kolom={list(df.columns)}"
+    # Model WAJIB ada - itu resource yang di-bundle. Database TIDAK: kalau belum
+    # diunduh, dilaporkan INFO supaya selftest instalasi baru tetap lolos.
+    cek("model/best.pt", lambda: ukuran(MODEL_PATH))
 
-    cek(f"baca {os.path.basename(DB_FILE)}", baca_db)
+    for nama, path in (("database rekening", DB_FILE),
+                       ("database stan baca", STAN_BACA_DB_FILE)):
+        if path:
+            cek(f"{nama} ({os.path.basename(path)})", lambda p=path: ukuran(p))
+        else:
+            tulis(f"  INFO  {nama}: belum diunduh untuk unit ini "
+                  f"(pakai tombol Cek Database)")
+
+    if DB_FILE:
+        def baca_db():
+            # Engine mengikuti ekstensi: .xlsb butuh pyxlsb, .xlsx openpyxl.
+            from core.loader import _read_excel_auto
+            df = _read_excel_auto(DB_FILE).head(5)
+            return f"terbaca, kolom={list(df.columns)}"
+
+        cek(f"baca {os.path.basename(DB_FILE)}", baca_db)
 
     tulis("--- model YOLO ---")
 

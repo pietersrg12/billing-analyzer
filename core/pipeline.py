@@ -5,6 +5,7 @@ Flow:
   LOAD -> PREPARE -> ANALYZE -> SIMBA AUTH -> INFO -> DOWNLOAD -> EXPORT -> FORMAT
 """
 
+import json
 import os
 from datetime import datetime
 
@@ -52,11 +53,61 @@ from core.db_updater import (
     parse_kode_baca_export,
 )
 from core.dlpd_merge import gabung_dlpd_dpm
-from core.loader import _read_excel_auto, load_data, load_stanbaca_data
+from core.loader import (
+    _read_excel_auto,
+    load_data,
+    load_stanbaca_data,
+    read_unitup,
+)
 from core.photo import download_photos
 from core.reader import is_available as reader_available
 from core.reader import read_meter_batch
 from core.simba_client import SimbaAuthError, SimbaClient, SimbaError
+
+
+def unit_dari_token():
+    """Unit dari token tersimpan: billing dulu, lalu SIMBA. None kalau belum ada.
+
+    Dipakai saat belum ada file DPM yang dipilih (mis. tombol Cek Database).
+    Token billing menyimpan unitup secara eksplisit; token SIMBA hanya punya
+    username berformat "44320.nama", jadi diambil awalannya.
+    """
+    try:
+        with open(BILLING_TOKEN_FILE, "r", encoding="utf-8") as f:
+            u = json.load(f).get("unitup")
+        if u:
+            return str(u).strip()
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        with open(SIMBA_TOKEN_FILE, "r", encoding="utf-8") as f:
+            nama = json.load(f).get("username") or ""
+        awalan = str(nama).split(".")[0].strip()
+        if awalan:
+            return awalan
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def unit_untuk_dpm(dpm_path, log=None):
+    """Unit yang berlaku untuk satu file DPM/DLPD.
+
+    File itu sendiri yang paling berhak menentukan miliknya siapa - lebih tepat
+    daripada unit token, yang bisa saja milik user lain di komputer yang sama.
+    Kalau filenya tidak menyatakan satu unit yang tunggal, baru jatuh ke token,
+    dan itu dicatat di log supaya tidak terjadi diam-diam.
+    """
+    unit = read_unitup(dpm_path)
+    if unit:
+        return unit
+    unit = unit_dari_token()
+    if log:
+        if unit:
+            log(f"File tidak menyatakan satu unit; memakai unit token: {unit}")
+        else:
+            log("Unit tidak diketahui - database dianggap belum ada")
+    return unit
 
 
 def _get_simba_client(
@@ -152,13 +203,21 @@ def run_pipeline(
 
     # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ LOAD Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     log("LOAD DATA")
-    dpm, db = load_data(dpm_path, db_path())
+    unitup = unit_untuk_dpm(dpm_path, log)
+    log(f"Unit: {unitup or 'tidak diketahui'}")
+    berkas_db = db_path(unitup)
+    if berkas_db:
+        log(f"Database rekening: {os.path.basename(berkas_db)}")
+    else:
+        log("Database rekening unit ini belum ada - semua baris jadi DATA BARU. "
+            "Pakai tombol Cek Database untuk mengunduhnya.")
+    dpm, db = load_data(dpm_path, berkas_db)
 
     stanbaca_db = None
     if ENABLE_STAN_BACA:
-        stanbaca_db = load_stanbaca_data(stanbaca_db_path())
+        stanbaca_db = load_stanbaca_data(stanbaca_db_path(unitup))
         if stanbaca_db is None:
-            log("Database stan baca tidak ditemukan/tidak valid - dilewati")
+            log("Database stan baca unit ini belum ada - dilewati")
         else:
             log(f"Database stan baca dimuat ({len(stanbaca_db)} baris)")
 
@@ -476,7 +535,7 @@ def run_pipeline(
 # UPDATE DATABASE OTOMATIS
 # =========================
 
-def run_db_check(blth, progress_callback=None):
+def run_db_check(blth, unitup=None, progress_callback=None):
     """Cek kelengkapan kedua database untuk analisis periode `blth`.
 
     Aturannya sama dengan verifikasi yang jalan di dalam pipeline: minimal
@@ -492,24 +551,32 @@ def run_db_check(blth, progress_callback=None):
     cfg = settings.load_rules()
     n_bulan = cfg["jumlah_bulan_rata2"]
 
+    if not unitup:
+        unitup = unit_dari_token()
+
     log(f"Cek database untuk periode {blth} (butuh {n_bulan} bulan ke belakang)")
+    log(f"Unit: {unitup or 'belum diketahui - login dulu lewat Update Database'}")
 
     db = None
-    try:
-        terbaca = _read_excel_auto(db_path())
-        terbaca["BULAN"] = terbaca["BULAN"].astype(int)
-        db = terbaca
-        log(f"Database rekening: {len(db):,} baris ({os.path.basename(db_path())})")
-    except Exception as e:
-        # db sengaja dibiarkan None: DataFrame setengah jadi (mis. tanpa kolom
-        # BULAN) akan meledak di check_coverage, jauh dari sumber masalahnya.
-        log(f"Database rekening tidak terbaca: {e}")
+    berkas_db = db_path(unitup)
+    if not berkas_db:
+        log("Database rekening unit ini belum ada")
+    else:
+        try:
+            terbaca = _read_excel_auto(berkas_db)
+            terbaca["BULAN"] = terbaca["BULAN"].astype(int)
+            db = terbaca
+            log(f"Database rekening: {len(db):,} baris ({os.path.basename(berkas_db)})")
+        except Exception as e:
+            # db sengaja dibiarkan None: DataFrame setengah jadi (mis. tanpa
+            # kolom BULAN) akan meledak di check_coverage, jauh dari sumbernya.
+            log(f"Database rekening tidak terbaca: {e}")
 
     stanbaca_db = None
     if ENABLE_STAN_BACA:
-        stanbaca_db = load_stanbaca_data(stanbaca_db_path())
+        stanbaca_db = load_stanbaca_data(stanbaca_db_path(unitup))
         if stanbaca_db is None:
-            log("Database stan baca tidak ditemukan/tidak valid")
+            log("Database stan baca unit ini belum ada")
         else:
             log(f"Database stan baca: {len(stanbaca_db):,} baris")
 
@@ -531,6 +598,7 @@ def run_db_check(blth, progress_callback=None):
     return {
         "blth": blth,
         "n_bulan": n_bulan,
+        "unitup": unitup,
         "rekening": cov_rekening,
         "stanbaca": cov_stanbaca,
     }
@@ -640,7 +708,7 @@ def _sufiks_kode(kode_list):
 
 
 def _unduh_rekening(bulan_list, progress_callback, stop_flag,
-                    billing_login_event, billing_credentials_holder):
+                    billing_login_event, billing_credentials_holder, unit=None):
     """Unduh + parse export billing untuk tiap bulan. Return DataFrame gabungan."""
 
     def log(msg):
@@ -651,6 +719,11 @@ def _unduh_rekening(bulan_list, progress_callback, stop_flag,
 
     def kerja(client):
         del frames[:]
+        # Unit dicatat DI SINI, satu-satunya tempat ia diketahui pasti: client
+        # yang benar-benar berhasil login. Pemanggil memakainya untuk memilih
+        # file database tujuan.
+        if unit is not None:
+            unit["unitup"] = client.unitup
         for bulan in bulan_list:
             if stop_flag and stop_flag():
                 log("Dibatalkan")
@@ -677,7 +750,7 @@ def _unduh_rekening(bulan_list, progress_callback, stop_flag,
 
 
 def _unduh_stanbaca(bulan_list, progress_callback, stop_flag,
-                    login_event, credentials_holder):
+                    login_event, credentials_holder, unit=None):
     """Unduh + parse laporan kode baca (3 kategori/bulan). Return DataFrame gabungan."""
 
     def log(msg):
@@ -687,6 +760,8 @@ def _unduh_stanbaca(bulan_list, progress_callback, stop_flag,
     client = _get_simba_client(
         None, bulan_list[0], progress_callback, login_event, credentials_holder
     )
+    if unit is not None:
+        unit["unitup"] = client.unitup
 
     frames = []
     for bulan in bulan_list:
@@ -737,6 +812,12 @@ def run_db_update(
             progress_callback(("percent", p))
 
     hasil = {"rekening": None, "stanbaca": None}
+    # Unit tiap sumber dicatat terpisah: rekening dari portal billing, stan baca
+    # dari SIMBA. Keduanya biasanya sama, tapi jangan diasumsikan - kalau user
+    # login sebagai unit berbeda di dua sistem itu, masing-masing tetap harus
+    # menulis ke database unitnya sendiri.
+    unit_rek = {"unitup": None}
+    unit_sb = {"unitup": None}
     percent(0)
 
     # ----- REKENING -----
@@ -745,7 +826,7 @@ def run_db_update(
         try:
             df = _unduh_rekening(
                 bulan_rekening, progress_callback, stop_flag,
-                billing_login_event, billing_credentials_holder,
+                billing_login_event, billing_credentials_holder, unit_rek,
             )
         except BillingAuthError:
             # Token ditolak server: buang supaya run berikutnya minta login lagi.
@@ -755,7 +836,7 @@ def run_db_update(
             return hasil
         percent(40)
         log(f"Tulis database rekening ({len(df):,} baris baru diunduh)...")
-        hasil["rekening"] = append_rekening(df)
+        hasil["rekening"] = append_rekening(df, unit_rek["unitup"])
         _log_statistik(log, "Database rekening", hasil["rekening"])
     percent(50)
 
@@ -769,7 +850,7 @@ def run_db_update(
         try:
             df = _unduh_stanbaca(
                 bulan_stanbaca, progress_callback, stop_flag,
-                login_event, credentials_holder,
+                login_event, credentials_holder, unit_sb,
             )
         except SimbaAuthError:
             _hapus_token(SIMBA_TOKEN_FILE)
@@ -778,7 +859,7 @@ def run_db_update(
             return hasil
         percent(85)
         log(f"Tulis database stan baca ({len(df):,} baris baru diunduh)...")
-        hasil["stanbaca"] = append_stanbaca(df)
+        hasil["stanbaca"] = append_stanbaca(df, unit_sb["unitup"])
         _log_statistik(log, "Database stan baca", hasil["stanbaca"])
 
     percent(100)

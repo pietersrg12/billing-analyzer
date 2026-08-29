@@ -483,6 +483,7 @@ class DialogMixin:
 
         blth = payload.get("blth", "")
         n_bulan = payload.get("n_bulan", 6)
+        unitup = payload.get("unitup")
 
         dialog = tb.Toplevel(self.root)
         dialog.title("Cek Database")
@@ -502,8 +503,9 @@ class DialogMixin:
 
         tb.Label(
             frm,
-            text=f"Untuk menganalisis periode {blth}, database wajib punya "
-                 f"{n_bulan} bulan sebelumnya.",
+            text=f"Unit {unitup or '(belum diketahui - login dulu)'} - untuk "
+                 f"menganalisis periode {blth}, database wajib punya {n_bulan} "
+                 f"bulan sebelumnya. Tiap unit punya databasenya sendiri.",
             font=("Segoe UI", 9),
             bootstyle=SECONDARY,
             wraplength=470,

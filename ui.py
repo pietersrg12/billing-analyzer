@@ -644,6 +644,10 @@ class App(DialogMixin):
         # sampai membekukan Tk. Hasilnya dikembalikan lewat queue seperti
         # semua pesan pipeline lain.
         try:
+            # unitup dibiarkan None: run_db_check yang mencarinya dari token
+            # tersimpan. Kalau belum ada token pun tidak apa-apa - database
+            # dianggap belum ada, semua bulan dilaporkan kurang, dan tombol
+            # Update Database muncul untuk memulai login.
             hasil = run_db_check(blth, progress_callback=self.queue.put)
             self.queue.put(("db_check_result", hasil))
         except Exception as e:
