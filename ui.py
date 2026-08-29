@@ -84,6 +84,23 @@ class VerificationResultHolder:
 # dipakai sebagai tebakan awal combobox periode.
 TANGGAL_GANTI_PERIODE = 20
 
+# Batas bawah pilihan tahun. Tetap, karena file DPM lama masih boleh dibuka;
+# batas atasnya yang ikut berjalan (lihat daftar_tahun).
+TAHUN_AWAL = 2020
+
+
+def daftar_tahun(hari_ini=None):
+    """Pilihan tahun untuk combobox: TAHUN_AWAL s.d. tahun berjalan + 1.
+
+    Dihitung, bukan didaftar tetap, supaya tidak pernah mentok - daftar yang
+    dipaku akan diam-diam kedaluwarsa dan memaksa user memilih tahun yang
+    salah. Batas atasnya +1 karena periode_default() melompat ke Januari tahun
+    berikutnya sejak 20 Desember; tanpa itu, tebakannya sendiri tidak akan ada
+    di daftar.
+    """
+    now = hari_ini or datetime.now()
+    return [str(t) for t in range(TAHUN_AWAL, now.year + 2)]
+
 
 def periode_default(hari_ini=None):
     """Tebakan periode (tahun, bulan) berdasarkan tanggal hari ini.
@@ -327,11 +344,13 @@ class App:
             side=LEFT, padx=(0, 8)
         )
 
+        sekarang = datetime.now()
+
         self.year_var = tk.StringVar()
         self.year_cb = tb.Combobox(
             period_frame,
             textvariable=self.year_var,
-            values=[str(i) for i in range(2020, 2031)],
+            values=daftar_tahun(sekarang),
             width=8,
             state="readonly",
             bootstyle=INFO,
@@ -353,13 +372,10 @@ class App:
         )
         self.month_cb.pack(side=LEFT)
 
-        tahun_awal, bulan_awal = periode_default()
-        if tahun_awal in self.year_cb["values"]:
-            self.year_cb.set(tahun_awal)
-        else:
-            # Di luar rentang combobox (mis. aplikasi dipakai setelah 2031):
-            # jatuh ke tahun terakhir yang tersedia daripada membiarkan kosong.
-            self.year_cb.set(self.year_cb["values"][-1])
+        # `sekarang` yang sama dipakai daftar_tahun() di atas, jadi tebakannya
+        # dijamin ada di daftar - tidak perlu jalur cadangan.
+        tahun_awal, bulan_awal = periode_default(sekarang)
+        self.year_cb.set(tahun_awal)
         self.month_cb.set(bulan_awal)
 
         tb.Label(
