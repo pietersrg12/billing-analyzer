@@ -215,7 +215,6 @@ class App(DialogMixin):
             text="Unit: -",
             bootstyle=(SECONDARY, OUTLINE),
             command=self._ganti_unit,
-            width=14,
         )
         self.unit_btn.pack(side=RIGHT, padx=(5, 0))
 
@@ -239,6 +238,9 @@ class App(DialogMixin):
         if unit:
             self.unit_btn.config(text=f"Unit: {unit}", bootstyle=(INFO, OUTLINE))
         else:
+            # Tanpa width tetap, tombol menyesuaikan isinya. Dengan width dipaku,
+            # "Unit: belum dipilih" terpotong jadi "Unit: belum dipi" - persis di
+            # keadaan yang paling perlu terbaca, yaitu instalasi yang belum login.
             self.unit_btn.config(
                 text="Unit: belum dipilih", bootstyle=(WARNING, OUTLINE)
             )
