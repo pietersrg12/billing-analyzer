@@ -1,12 +1,16 @@
 ; ============================================================
-; PLN Billing Analyzer v2.1 - Inno Setup script
+; SIMBA (Sistem Monitoring Baca Meter) v2.5 - Inno Setup script
 ; ============================================================
 ; Compile: iscc installer.iss
-; Output : Output\PLN-Billing-Setup-v2.1.exe
+; Output : Output\SIMBA-Setup-v2.5.exe
+;
+; Hanya nama TAMPILAN yang SIMBA. AppId, nama .exe, dan DefaultDirName sengaja
+; tetap: mengubahnya membuat installer baru tidak mengenali instalasi lama
+; (terpasang ganda) dan folder data user pindah tempat.
 ; ============================================================
 
-#define AppName     "PLN Billing Analyzer"
-#define AppVersion  "2.1"
+#define AppName     "SIMBA"
+#define AppVersion  "2.7"
 #define AppPublisher "PLN"
 #define AppExeName  "PLN-Billing.exe"
 
@@ -17,13 +21,13 @@ AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
 AppVerName={#AppName} {#AppVersion}
 DefaultDirName={localappdata}\PLN-Billing
-DefaultGroupName=PLN Billing Analyzer
+DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 DisableDirPage=no
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 OutputDir=Output
-OutputBaseFilename=PLN-Billing-Setup-v{#AppVersion}
+OutputBaseFilename=SIMBA-Setup-v{#AppVersion}
 SetupIconFile=assets\icon.ico
 UninstallDisplayIcon={app}\{#AppExeName}
 Compression=lzma2/ultra64
@@ -43,10 +47,16 @@ Name: "desktopicon"; Description: "Buat shortcut di Desktop"; GroupDescription: 
 ; Semua isi dist\PLN-Billing\
 Source: "dist\PLN-Billing\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[InstallDelete]
+; Shortcut bernama lama (sebelum rebranding SIMBA). Tanpa ini, user yang upgrade
+; punya dua shortcut ke .exe yang sama.
+Type: filesandordirs; Name: "{autoprograms}\PLN Billing Analyzer"
+Type: files; Name: "{userdesktop}\PLN Billing Analyzer.lnk"
+
 [Icons]
-Name: "{group}\PLN Billing Analyzer"; Filename: "{app}\{#AppExeName}"
-Name: "{group}\Uninstall PLN Billing Analyzer"; Filename: "{uninstallexe}"
-Name: "{userdesktop}\PLN Billing Analyzer"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExeName}"
+Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
+Name: "{userdesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Jalankan {#AppName}"; Flags: nowait postinstall skipifsilent

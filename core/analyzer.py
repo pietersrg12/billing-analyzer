@@ -5,6 +5,10 @@ import pandas as pd
 # ulang sebagai literal supaya tidak lepas sinkron.
 STATUS_JAM_TINGGI = ">720JN"
 
+# Ditagih lagi setelah bulan lalu 0 kWh, tanpa dukungan stan ACMT. Lihat
+# tandai_tagih_ulang_pasca_nol - rule ini jalan setelah ACMT ditempel.
+STATUS_PASCA_NOL = "Tagih Ulang Pasca Nol"
+
 # =========================
 # RULES
 # =========================
@@ -108,8 +112,11 @@ def prepare(df, db, cfg):
     }, inplace=True)
 
     # --- Previous month usage (bulan lalu) ---
-    prev = db_sorted.groupby("IDPEL")["PEMAKAIAN"].last().reset_index()
-    prev.rename(columns={"PEMAKAIAN": "PEMAKAIAN_BULAN_LALU"}, inplace=True)
+    # BULAN_DB_TERAKHIR ikut disimpan supaya rule pasca-nol bisa memastikan
+    # "bulan lalu" memang blth-1, bukan bulan tua dari database yang tertinggal.
+    prev = db_sorted.groupby("IDPEL")[["PEMAKAIAN", "BULAN"]].last().reset_index()
+    prev = prev.rename(columns={"PEMAKAIAN": "PEMAKAIAN_BULAN_LALU",
+                                "BULAN": "BULAN_DB_TERAKHIR"})
     df = df.merge(prev, on="IDPEL", how="left")
     df["PEMAKAIAN_BULAN_LALU"] = df["PEMAKAIAN_BULAN_LALU"].fillna(0).astype(int)
 
@@ -187,6 +194,53 @@ def apply_analysis(df, cfg):
     return df
 
 
+# Status yang keputusannya bersandar pada RATA2 - boleh ditimpa rule pasca
+# nol, karena RATA2 justru tercemar bulan estimasi. Status berbasis stand
+# (Stand Minus, Stand Tidak Wajar, Meter Macet, >720JN) tetap menang.
+STATUS_BOLEH_PASCA_NOL = ("Normal", "Kenaikan", "Penurunan", "Trend Naik")
+
+
+def tandai_tagih_ulang_pasca_nol(df, blth, cfg):
+    """Tandai baris yang ditagih lagi setelah bulan lalu dinolkan, padahal
+    stand tagihannya tidak didukung bacaan ACMT bulan ini.
+
+    Pola (IDPEL 443200000806, 202610): ACMT terbaca 1 sejak Juli, 202608
+    ditagih estimasi, 202609 dinolkan (lebih tagih), 202610 ditagih rata2 lagi
+    - lebih tagihnya terulang. RATA2 sudah tercemar bulan estimasi, jadi rule
+    lain melihatnya Normal.
+
+    Harus dipanggil SETELAH STAN_METER_ACMT ditempel (pipeline._tempel_kd_baca),
+    makanya tidak masuk RULES. Tanpa ACMT -> df apa adanya (billing tidak
+    dipakai sebagai cadangan). Return (df, jumlah_ditandai).
+    """
+    if "STAN_METER_ACMT" not in df.columns:
+        return df, 0
+
+    bulan_lalu = int((pd.Period(str(blth), freq="M") - 1).strftime("%Y%m"))
+    acmt = pd.to_numeric(df["STAN_METER_ACMT"], errors="coerce")
+    tol = cfg["pasca_nol_toleransi_acmt"]
+
+    mask = (
+        (df["BULAN_DB_TERAKHIR"] == bulan_lalu)
+        & (df["PEMAKAIAN_BULAN_LALU"] == 0)
+        & (df["STAND_KINI"] > df["STAND_LALU"])
+        & acmt.notna()
+        & ((acmt <= 1) | (df["STAND_KINI"] - acmt > tol))
+        & df["STATUS"].isin(STATUS_BOLEH_PASCA_NOL)
+    )
+    if not mask.any():
+        return df, 0
+
+    df = df.copy()
+    df.loc[mask, "STATUS"] = STATUS_PASCA_NOL
+    df.loc[mask, "DETAIL"] = df.loc[mask].apply(
+        lambda r: (f"Bln lalu 0 kWh, kini {r['PEMAKAIAN']:.0f} | "
+                   f"stand {r['STAND_KINI']:.0f} vs ACMT {r['STAN_METER_ACMT']:.0f}"),
+        axis=1,
+    )
+    return df, int(mask.sum())
+
+
 def compute_stanbaca_comparison(df, stanbaca_db, blth, cfg):
     """Bandingkan pemakaian rekening vs pemakaian asli dari stan baca meter.
 
@@ -198,16 +252,21 @@ def compute_stanbaca_comparison(df, stanbaca_db, blth, cfg):
     database stan baca). Bacaan fisik untuk blth itu sendiri (STAND_BACA_KINI)
     tidak dipakai karena secara siklus baca PLN nyaris tidak pernah tersedia
     saat blth baru diproses - bacaan fisik blth baru masuk database stan baca
-    sebagai data blth+1. NaN kalau STAND_BACA_LALU belum ada sama sekali
-    untuk IDPEL tsb.
+    sebagai data blth+1.
+
+    STAND_BACA_LALU diambil HANYA dari BULAN = blth-1. Kalau bulan itu tidak
+    ada untuk IDPEL tsb hasilnya NaN - jangan pernah jatuh ke bulan yang lebih
+    tua: PEMAKAIAN_ASLI lalu mencakup dua bulan dan SELISIH_STAN_BACA tampak
+    seperti temuan, padahal databasenya saja yang belum di-update (2026-09:
+    blth 202610 diam-diam memakai baca Juli).
     """
     if stanbaca_db is None or stanbaca_db.empty:
         return df
 
-    sb_sorted = stanbaca_db.sort_values(["IDPEL", "BULAN"])
-    blth_int = int(blth)
+    bulan_lalu = int((pd.Period(str(blth), freq="M") - 1).strftime("%Y%m"))
 
-    lalu = sb_sorted[sb_sorted["BULAN"] < blth_int].groupby("IDPEL").tail(1)[["IDPEL", "STAND"]]
+    sb_sorted = stanbaca_db.sort_values(["IDPEL", "BULAN"])
+    lalu = sb_sorted[sb_sorted["BULAN"] == bulan_lalu].groupby("IDPEL").tail(1)[["IDPEL", "STAND"]]
     lalu = lalu.rename(columns={"STAND": "STAND_BACA_LALU"})
 
     df = df.merge(lalu, on="IDPEL", how="left")

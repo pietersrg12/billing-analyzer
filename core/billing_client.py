@@ -65,7 +65,12 @@ class BillingClient:
             allowed_methods=("GET", "POST"),
             raise_on_status=False,
         )
-        adapter = HTTPAdapter(max_retries=retry)
+        # Pool di-set eksplisit (default requests cuma 10) karena DLPD & DPM
+        # bisa ditarik bersamaan lewat 2 thread pada session yang sama.
+        adapter = HTTPAdapter(
+            pool_connections=10, pool_maxsize=10, pool_block=False,
+            max_retries=retry,
+        )
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
@@ -181,10 +186,9 @@ class BillingClient:
     def probe(self):
         """Cek validitas token TANPA request jaringan.
 
-        Beda dari SimbaClient.probe() yang harus memanggil infopelanggan pakai
-        satu IDPEL: token portal billing membawa klaim `exp`, jadi kedaluwarsa
-        bisa dibaca langsung dari JWT-nya. Ini penting karena update database
-        jalan tanpa file DPM dimuat - tidak ada IDPEL untuk di-probe.
+        Token portal billing membawa klaim `exp`, jadi kedaluwarsa bisa dibaca
+        langsung dari JWT-nya tanpa request - penting karena update database
+        jalan tanpa file DPM dimuat, jadi tidak ada IDPEL untuk di-probe.
         """
         if not self.token:
             return False
@@ -335,7 +339,30 @@ class BillingClient:
         os.replace(tmp_path, save_path)
         return total
 
-    def download_billing_detail(self, thblrek, save_path, size, timeout=600):
+    def _unduh_dengan_catat(self, path_list, path_export, payload, save_path,
+                            label, timeout, catat):
+        """hitung_total + _unduh_export, mencatat durasi tiap bagian kalau diminta.
+
+        Dipisah supaya ketiga download method memakai pola & log yang sama,
+        dan supaya porsi preflight-count vs generate-di-server kelihatan.
+        """
+        t0 = time.perf_counter()
+        total = self.hitung_total(path_list, payload)
+        t_count = time.perf_counter() - t0
+        if total:
+            payload["size"] = total
+
+        t1 = time.perf_counter()
+        n = self._unduh_export(path_export, payload, save_path, label, timeout)
+        t_export = time.perf_counter() - t1
+
+        if catat:
+            catat(f"    ({label}: hitung-total {t_count:.1f}s + "
+                  f"generate+unduh {t_export:.1f}s = {t_count + t_export:.1f}s)")
+        return n
+
+    def download_billing_detail(self, thblrek, save_path, size, timeout=600,
+                                catat=None):
         """Unduh Monitoring_Billing_Detail satu periode (sumber database rekening)."""
         payload = self._payload_unit(thblrek)
         payload.update({
@@ -346,17 +373,14 @@ class BillingClient:
             "kdProsesKlp": ["SEMUA"],
             "tipe": "excel",
         })
-        total = self.hitung_total(self.URL_LIST_BILLING, payload)
-        if total:
-            payload["size"] = total
-        return self._unduh_export(
-            self.URL_EXPORT_BILLING, payload, save_path,
-            f"export billing {thblrek}", timeout,
+        return self._unduh_dengan_catat(
+            self.URL_LIST_BILLING, self.URL_EXPORT_BILLING, payload, save_path,
+            f"export billing {thblrek}", timeout, catat,
         )
 
     def download_dlpd_detail(self, thblrek, kode_list, save_path,
                              dlpd="SEMUA", status_verifikasi="BELUM",
-                             size=None, timeout=600):
+                             size=None, timeout=600, catat=None):
         """Unduh Monitoring_Dlpd_Detail - file input utama aplikasi."""
         payload = self._payload_unit(thblrek)
         payload.update({
@@ -372,16 +396,25 @@ class BillingClient:
             "tipe": "excel",
             "dlpdPlts": None,
         })
+        label = f"export DLPD {thblrek}"
+        t_count = 0.0
         if not size:
+            t0 = time.perf_counter()
             total = self.hitung_total(self.URL_LIST_DLPD, payload)
+            t_count = time.perf_counter() - t0
             payload["size"] = total or 100000
-        return self._unduh_export(
-            self.URL_EXPORT_DLPD, payload, save_path,
-            f"export DLPD {thblrek}", timeout,
-        )
+        t1 = time.perf_counter()
+        n = self._unduh_export(self.URL_EXPORT_DLPD, payload, save_path,
+                               label, timeout)
+        t_export = time.perf_counter() - t1
+        if catat:
+            catat(f"    ({label}: hitung-total {t_count:.1f}s + "
+                  f"generate+unduh {t_export:.1f}s = {t_count + t_export:.1f}s)")
+        return n
 
     def download_dpm_detail(self, thblrek, kode_list, save_path,
-                            kodeposting="SUDAH", size=None, timeout=600):
+                            kodeposting="SUDAH", size=None, timeout=600,
+                            catat=None):
         """Unduh Monitoring_DPM_Detail - dipakai hanya untuk kelainan_bc_meter."""
         payload = self._payload_unit(thblrek)
         payload.update({
@@ -392,13 +425,21 @@ class BillingClient:
             "idpel": "",
             "tipe": "excel",
         })
+        label = f"export DPM {thblrek}"
+        t_count = 0.0
         if not size:
+            t0 = time.perf_counter()
             total = self.hitung_total(self.URL_LIST_DPM, payload)
+            t_count = time.perf_counter() - t0
             payload["size"] = total or 100000
-        return self._unduh_export(
-            self.URL_EXPORT_DPM, payload, save_path,
-            f"export DPM {thblrek}", timeout,
-        )
+        t1 = time.perf_counter()
+        n = self._unduh_export(self.URL_EXPORT_DPM, payload, save_path,
+                               label, timeout)
+        t_export = time.perf_counter() - t1
+        if catat:
+            catat(f"    ({label}: hitung-total {t_count:.1f}s + "
+                  f"generate+unduh {t_export:.1f}s = {t_count + t_export:.1f}s)")
+        return n
 
 
 # =========================

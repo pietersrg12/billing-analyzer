@@ -1,4 +1,4 @@
-"""PLN Billing Analyzer - entry point.
+"""SIMBA (Sistem Monitoring Baca Meter) - entry point.
 
 Setup runtime environment (folder data user, log error global) lalu
 launch GUI Tkinter.
@@ -11,6 +11,8 @@ from datetime import datetime
 
 from config import (
     APP_DATA_DIR,
+    APP_NAMA,
+    APP_SUBJUDUL,
     DB_BACKUP_DIR,
     FOTO_DIR,
     HASIL_DIR,
@@ -69,14 +71,15 @@ def main():
     import ttkbootstrap as tb
     from ui import App, HAS_DND
 
+    judul = f"{APP_NAMA} - {APP_SUBJUDUL}"
     if HAS_DND:
         from tkinterdnd2 import TkinterDnD
         root = TkinterDnD.Tk()
         tb.Style(theme="darkly")
     else:
-        root = tb.Window(title="PLN Billing Analyzer", themename="darkly")
+        root = tb.Window(title=judul, themename="darkly")
 
-    root.title("PLN Billing Analyzer")
+    root.title(judul)
     _set_window_icon(root)
     App(root)
     root.mainloop()

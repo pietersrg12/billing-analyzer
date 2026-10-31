@@ -1,6 +1,6 @@
 @echo off
 REM ============================================================
-REM Build script PLN Billing Analyzer v2.1
+REM Build script SIMBA (Sistem Monitoring Baca Meter) v2.7
 REM ============================================================
 REM Prasyarat:
 REM   - Python 3.10 dengan semua dependency terinstall
@@ -10,7 +10,7 @@ REM   - Inno Setup 6 (opsional, untuk installer)
 REM
 REM Output:
 REM   - dist\PLN-Billing\PLN-Billing.exe   (folder distribution)
-REM   - Output\PLN-Billing-Setup-v2.1.exe  (installer)
+REM   - Output\SIMBA-Setup-v2.7.exe        (installer)
 REM
 REM CATATAN: yang di-build adalah build_obf\ (salinan teracak PyArmor),
 REM bukan source folder ini. Lihat pln_billing.spec.

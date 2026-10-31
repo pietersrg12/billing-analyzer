@@ -1,31 +1,70 @@
 """
-SIMBA API client.
+Client API ACMT (gateway FSM).
+
+Di teks UI/log server ini disebut ACMT - SIMBA sudah menjadi nama aplikasi.
+Nama modul, kelas, dan exception tetap `simba` karena riwayat kodenya.
 
 Wraps:
 - POST /acmt/v1/auth/login         -> bearer token
+- POST /acmt/v1/auth/logout        -> tutup sesi di server
 - POST /acmt/informasi/infopelanggan -> data + URL foto
-- GET <pathFoto URL>               -> binary image
+- GET <pathFoto URL>               -> gambar, atau amplop JSON {storage, url|urlPhoto}
+- GET <urlPhoto>                   -> binary image (/acmt/download/photo/meternfs/...)
 - POST /acmt/laporan/rekapkbtunggal/detail/download/excel
                                    -> .xlsx dalam bungkus JSON base64
 
-Token cached to disk so user only logs in once per session lifetime
-(or until token expires).
+Skema request auth diambil dari spesifikasi gateway sendiri
+(GET /gateway/openapi/raw, tanpa login).
+
+Setiap sesi = login -> kerja -> logout. Token TIDAK disimpan ke disk: setelah
+logout token itu sudah dicabut server, jadi tidak ada yang bisa dipakai ulang.
+`tokenInfo` adalah kode enkripsi dari generator milik user yang di-paste di
+dialog login (sama seperti portal billing) - tidak bisa diturunkan dari
+password.
 """
 
 import base64
+import io
 import json
 import os
+from urllib.parse import urljoin
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
 class SimbaAuthError(Exception):
-    """Raised when SIMBA returns 401 or login fails."""
+    """Raised when ACMT returns 401 or login fails."""
 
 
 class SimbaError(Exception):
-    """Generic SIMBA API error."""
+    """Generic ACMT API error."""
+
+
+def adalah_gambar(awal):
+    """True kalau byte awal file bertanda JPEG atau PNG.
+
+    Server bisa membalas HTTP 200 berisi JSON, jadi tanda tangan file lebih
+    andal daripada content-type atau ukuran. Dipakai juga oleh photo.py untuk
+    menolak file cache yang bukan gambar.
+    """
+    return bool(awal) and (awal[:3] == b"\xff\xd8\xff" or awal[:4] == b"\x89PNG")
+
+
+def _simpan_mentah_kode_baca(isi, blth, kdbaca):
+    """Simpan balasan kode baca yang tidak terbaca, untuk diagnosis. Tidak pernah raise."""
+    try:
+        from config import user_path
+        folder = user_path("unduhan")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(
+            folder, f"_acmt_gagal_{blth}_{kdbaca.replace(' ', '_')}.bin")
+        with open(path, "wb") as f:
+            f.write(isi)
+        return path
+    except Exception as e:
+        return f"(gagal disimpan: {e})"
 
 
 class SimbaClient:
@@ -70,23 +109,26 @@ class SimbaClient:
 
         self.username = None
         self.token = None
+        # Disimpan di memori saja, dibutuhkan lagi oleh logout().
+        self.token_info = None
 
     # =========================
     # AUTH
     # =========================
 
-    def login(self, username, password):
+    def login(self, username, password, token_info):
+        """Login ACMT. `token_info` = kode enkripsi yang di-paste user."""
         url = f"{self.base_url}/acmt/v1/auth/login"
         payload = {
             "username": username,
             "password": password,
-            "tokenInfo": password,
+            "tokenInfo": token_info,
         }
 
         try:
             resp = self.session.post(url, json=payload, timeout=30)
         except requests.RequestException as e:
-            raise SimbaError(f"Tidak bisa terhubung ke SIMBA: {e}")
+            raise SimbaError(f"Tidak bisa terhubung ke ACMT: {e}")
 
         if resp.status_code != 200:
             raise SimbaAuthError(
@@ -113,41 +155,61 @@ class SimbaClient:
             token = d
 
         if not token:
-            raise SimbaAuthError("Token tidak ditemukan di response login")
+            # Nama field saja (bukan nilainya) supaya penyebab terlihat tanpa
+            # membocorkan isi balasan ke log.
+            kunci = sorted(d) if isinstance(d, dict) else type(d).__name__
+            raise SimbaAuthError(
+                "Token tidak ditemukan di response login "
+                f"(message: {data.get('message')!r}, data: {kunci})"
+            )
 
         self.username = username
         self.token = token
+        self.token_info = token_info
         self.session.headers.update({"authorization": f"Bearer {token}"})
 
-    def load_token(self, path):
-        """Load saved token. Return True if loaded successfully."""
-        if not os.path.exists(path):
-            return False
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            token = data.get("token")
-            username = data.get("username")
-            if not token or not username:
-                return False
-            self.token = token
-            self.username = username
-            self.session.headers.update({"authorization": f"Bearer {token}"})
-            return True
-        except (OSError, ValueError):
-            return False
+    def logout(self, timeout=30):
+        """Tutup sesi di server. Return (ok, pesan); tidak pernah raise.
 
-    def save_token(self, path):
-        if not self.token or not self.username:
-            return
+        Body-nya memakai `userName` (N besar), BEDA dari login yang `username` -
+        persis skema LogoutRequest di /gateway/openapi/raw. Token lokal selalu
+        dibuang, berhasil atau tidak, supaya client ini tidak dipakai lagi
+        dengan sesi yang mungkin sudah mati.
+        """
+        if not self.token:
+            return True, "tidak ada sesi aktif"
+
+        url = f"{self.base_url}/acmt/v1/auth/logout"
+        payload = {
+            "userName": self.username,
+            "tokenInfo": self.token_info or "",
+        }
+
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {"token": self.token, "username": self.username},
-                    f,
-                )
-        except OSError:
-            pass
+            try:
+                resp = self.session.post(url, json=payload, timeout=timeout)
+            except requests.RequestException as e:
+                return False, f"tidak bisa terhubung ke ACMT: {e}"
+
+            try:
+                data = resp.json()
+            except ValueError:
+                data = None
+
+            if isinstance(data, dict):
+                pesan = str(data.get("message") or "")
+                ok = resp.status_code == 200 and bool(data.get("success"))
+            else:
+                pesan = (resp.text or "")[:200]
+                ok = False
+
+            if not ok:
+                pesan = f"HTTP {resp.status_code}: {pesan}"
+            return ok, pesan
+        finally:
+            self.token = None
+            self.token_info = None
+            self.session.headers.pop("authorization", None)
 
     @property
     def unitup(self):
@@ -160,21 +222,9 @@ class SimbaClient:
     # API
     # =========================
 
-    def probe(self, idpel, blth):
-        """Test apakah token masih valid dengan panggil infopelanggan ringan."""
-        try:
-            self.get_info_pelanggan(idpel, blth, timeout=15)
-            return True
-        except SimbaAuthError:
-            return False
-        except SimbaError:
-            # Server error / timeout: anggap token mungkin valid, biar
-            # error muncul saat run pipeline saja
-            return True
-
     def get_info_pelanggan(self, idpel, blth, timeout=60):
         if not self.unitup:
-            raise SimbaError("Belum login ke SIMBA")
+            raise SimbaError("Belum login ke ACMT")
 
         url = f"{self.base_url}/acmt/informasi/infopelanggan"
         payload = {
@@ -212,57 +262,125 @@ class SimbaClient:
 
         return data.get("data", []) or []
 
+    # Amplop JSON yang wajar cuma ratusan byte; di atas ini pasti bukan amplop.
+    MAKS_BODY_AMPLOP = 1024 * 1024
+
     def download_foto(self, foto_url, save_path, timeout=30):
-        # Streaming download: hemat memory + lebih cepat untuk file besar.
-        # Pakai chunk write 64KB.
-        # Raise SimbaAuthError untuk 401 supaya caller bisa stop early.
-        #
-        # PENTING: server endpoint /acmt/download/photo/... produce image/jpeg.
-        # Default session header `accept: application/json` akan ditolak server
-        # dengan HTTP 406 ("The accept header value did not match the value in
-        # @Produces"). Jadi override Accept ke image/jpeg untuk request ini.
+        """Unduh satu foto ke save_path. Return True kalau gambar tersimpan.
+
+        URL `pathFoto` dari infopelanggan (/acmt/download/photo/meter/...)
+        bisa membalas gambar langsung, atau amplop JSON yang menunjuk file
+        aslinya: sejak 2026-09 {data: {storage: "NFS", urlPhoto: "/meternfs/..."}},
+        sejak 2026-10 untuk foto baru {data: {storage: "S3", url: "<presigned>"}}
+        (port 8086, X-Amz-Signature, berlaku 30 menit - dikirim TANPA Bearer).
+        Amplop diikuti SATU kali: JSON yang menunjuk ke JSON lagi dianggap
+        gagal, bukan diputar terus. URL-nya diikuti apa adanya, bukan ditebak,
+        karena field `storage` menandakan ada lebih dari satu backend.
+
+        Raise SimbaAuthError untuk 401 supaya caller bisa stop early.
+        """
+        url = foto_url
+        for _ in range(2):
+            hasil = self._unduh_atau_arahkan(url, save_path, timeout)
+            if not isinstance(hasil, str):
+                return hasil
+            url = hasil
+        return False
+
+    def _unduh_atau_arahkan(self, url, save_path, timeout):
+        """Satu GET foto. Return True/False, atau URL tujuan (str) kalau server
+        membalas amplop JSON berisi `urlPhoto`."""
+        # Default session header `accept: application/json` ditolak endpoint
+        # gambar dengan HTTP 406 ("The accept header value did not match the
+        # value in @Produces"). `*/*` tetap disertakan supaya amplop JSON dari
+        # /photo/meter/ juga diterima.
         headers = {"accept": "image/jpeg, image/*, */*"}
+        # urlPhoto lama bisa relatif (/meternfs/...) - lengkapi dengan host ACMT.
+        url = urljoin(self.base_url + "/", url)
+        # Bearer token HANYA untuk gateway ACMT. URL S3 presigned (port 8086,
+        # X-Amz-Signature) sudah membawa auth-nya sendiri di query: kalau
+        # Authorization ikut terkirim, S3 menolak (dua mekanisme auth), dan
+        # token tidak boleh bocor ke host lain. None = hapus dari header session.
+        if not url.startswith(self.base_url + "/"):
+            headers["authorization"] = None
+        tmp_path = save_path + ".part"
         try:
             with self.session.get(
-                foto_url, timeout=timeout, stream=True, headers=headers
+                url, timeout=timeout, stream=True, headers=headers
             ) as resp:
                 if resp.status_code == 401:
                     raise SimbaAuthError("Token expired saat download foto")
-
                 if resp.status_code != 200:
                     return False
 
-                # Validasi minimal length via header kalau ada
-                cl = resp.headers.get("content-length")
-                if cl and int(cl) < 100:
-                    return False
+                # Streaming 64KB: hemat memori untuk file besar.
+                chunks = resp.iter_content(chunk_size=65536)
+                awal = b""
+                for chunk in chunks:
+                    if chunk:
+                        awal = chunk
+                        break
+
+                ctype = (resp.headers.get("content-type") or "").lower()
+                if "json" in ctype or not adalah_gambar(awal):
+                    body = awal
+                    for chunk in chunks:
+                        body += chunk
+                        if len(body) > self.MAKS_BODY_AMPLOP:
+                            return False
+                    return self._url_dari_amplop(body)
 
                 try:
                     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                    tmp_path = save_path + ".part"
-                    total = 0
+                    total = len(awal)
                     with open(tmp_path, "wb") as f:
-                        for chunk in resp.iter_content(chunk_size=65536):
+                        f.write(awal)
+                        for chunk in chunks:
                             if chunk:
                                 f.write(chunk)
                                 total += len(chunk)
-
-                    if total < 100:
-                        try:
-                            os.remove(tmp_path)
-                        except OSError:
-                            pass
-                        return False
-
-                    # Atomic rename agar tidak ada file korup
-                    os.replace(tmp_path, save_path)
-                    return True
-                except OSError:
+                except (OSError, requests.RequestException):
+                    _hapus_diam(tmp_path)
                     return False
+
+                if total < 100:
+                    _hapus_diam(tmp_path)
+                    return False
+
+                # Atomic rename agar tidak ada file korup
+                try:
+                    os.replace(tmp_path, save_path)
+                except OSError:
+                    _hapus_diam(tmp_path)
+                    return False
+                return True
         except SimbaAuthError:
             raise
         except requests.RequestException:
             return False
+
+    @staticmethod
+    def _url_dari_amplop(body):
+        """Ambil `data.urlPhoto` dari amplop JSON. False kalau tidak ada."""
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return False
+        if not isinstance(data, dict):
+            return False
+        if not data.get("success"):
+            msg = str(data.get("message") or "")
+            if any(k in msg.lower() for k in ("token", "auth", "login")):
+                raise SimbaAuthError(f"Auth gagal saat download foto: {msg}")
+            return False
+        isi = data.get("data")
+        if not isinstance(isi, dict):
+            return False
+        # Sejak 2026-10 foto baru disimpan di S3 dan amplopnya membawa `url`
+        # (presigned, berlaku 30 menit); foto lama di NFS masih `urlPhoto`.
+        # Keduanya bisa muncul untuk satu pelanggan (beda bulan).
+        url = isi.get("url") or isi.get("urlPhoto")
+        return url if isinstance(url, str) and url.strip() else False
 
     def download_kode_baca(self, blth, kdbaca, timeout=300):
         """Unduh laporan Detail Kode Baca Tunggal satu kategori. Return bytes .xlsx.
@@ -278,7 +396,7 @@ class SimbaClient:
         disk wajib membedakan namanya sendiri.
         """
         if not self.unitup:
-            raise SimbaError("Belum login ke SIMBA")
+            raise SimbaError("Belum login ke ACMT")
 
         url = f"{self.base_url}/acmt/laporan/rekapkbtunggal/detail/download/excel"
         payload = {
@@ -324,9 +442,56 @@ class SimbaClient:
             )
 
         try:
-            return base64.b64decode(b64)
+            isi = base64.b64decode(b64)
         except (ValueError, TypeError) as e:
             raise SimbaError(f"Base64 kode baca {kdbaca} {blth} rusak: {e}")
+
+        # .xlsx asli berupa zip ("PK"). Sejak 2026-10 server membungkusnya
+        # sebagai wadah OLE2 terenkripsi (EncryptionInfo), dengan PASSWORD =
+        # username login ACMT lengkap (mis. "44320.SANTI"). Didekripsi di sini
+        # supaya parser di hilir tetap menerima .xlsx biasa tanpa perubahan.
+        if isi[:2] != b"PK":
+            if isi[:8] != b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1":
+                simpan = _simpan_mentah_kode_baca(isi, blth, kdbaca)
+                raise SimbaError(
+                    f"Laporan kode baca {kdbaca} {blth} bukan .xlsx maupun OLE2 "
+                    f"(awal {isi[:16]!r}, {len(isi):,} byte). Disimpan di {simpan}"
+                )
+            isi = self._dekripsi_xlsx(isi, blth, kdbaca)
+        return isi
+
+    def _dekripsi_xlsx(self, isi, blth, kdbaca):
+        """Dekripsi balasan ACMT yang terkunci. Password = username ACMT lengkap."""
+        try:
+            import msoffcrypto
+        except ImportError:
+            simpan = _simpan_mentah_kode_baca(isi, blth, kdbaca)
+            raise SimbaError(
+                "Laporan ACMT terenkripsi tapi 'msoffcrypto-tool' belum "
+                "terpasang (pip install msoffcrypto-tool). "
+                f"File tersimpan di {simpan}"
+            )
+
+        buf = io.BytesIO()
+        try:
+            kunci = msoffcrypto.OfficeFile(io.BytesIO(isi))
+            kunci.load_key(password=self.username)
+            kunci.decrypt(buf)
+        except Exception as e:
+            simpan = _simpan_mentah_kode_baca(isi, blth, kdbaca)
+            raise SimbaError(
+                f"Laporan kode baca {kdbaca} {blth} terenkripsi dan gagal "
+                f"didekripsi dengan username ACMT: {e}. Disimpan di {simpan}"
+            )
+
+        hasil = buf.getvalue()
+        if hasil[:2] != b"PK":
+            simpan = _simpan_mentah_kode_baca(isi, blth, kdbaca)
+            raise SimbaError(
+                f"Hasil dekripsi kode baca {kdbaca} {blth} bukan .xlsx. "
+                f"Disimpan di {simpan}"
+            )
+        return hasil
 
     # =========================
     # HELPERS
@@ -343,3 +508,10 @@ class SimbaClient:
                 if url:
                     return url
         return None
+
+
+def _hapus_diam(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass

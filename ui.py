@@ -22,17 +22,20 @@ from core.pipeline import (
     run_db_update,
     run_pipeline,
     run_unduh_dlpd,
+    logout_sesi_simba,
 )
 from core import settings
-from ui_dialogs import DialogMixin
+from ui_dialogs import DialogMixin, muat_logo
 from config import (
     APP_NAMA,
     APP_PEMBUAT,
+    APP_SUBJUDUL,
     APP_TAHUN,
     APP_TEMPAT,
     APP_VERSI,
     ENABLE_DB_DOWNLOAD,
     ENABLE_UNDUH_DLPD,
+    LOGO_EMBLEM_PATH,
     THEME_DARK,
     THEME_LIGHT,
 )
@@ -46,8 +49,8 @@ class CredentialsHolder:
         self._creds = None
 
     def set(self, username, password, token_info=None):
-        """`token_info` hanya dipakai portal billing (kode enkripsi yang
-        di-paste user). Pemanggil SIMBA tetap cukup dua argumen."""
+        """`token_info` = kode enkripsi yang di-paste user; dipakai login
+        ACMT maupun portal billing."""
         with self._lock:
             self._creds = {
                 "username": username,
@@ -132,7 +135,7 @@ class App(DialogMixin):
 
     def __init__(self, root):
         self.root = root
-        self.root.title("PLN Billing Analyzer")
+        self.root.title(f"{APP_NAMA} - {APP_SUBJUDUL}")
         self.root.minsize(720, 680)
         self.root.resizable(True, True)
 
@@ -146,7 +149,7 @@ class App(DialogMixin):
         self.verify_event = threading.Event()
         self.verify_holder = VerificationResultHolder()
         # Portal billing punya jalur login sendiri: host, token, dan skema
-        # kredensialnya beda dari SIMBA, jadi tidak bisa berbagi event.
+        # kredensialnya beda dari ACMT, jadi tidak bisa berbagi event.
         self.billing_login_event = threading.Event()
         self.billing_credentials_holder = CredentialsHolder()
 
@@ -158,7 +161,29 @@ class App(DialogMixin):
 
         self._perbarui_label_unit()
 
+        # Tutup window WAJIB lewat _on_close supaya sesi ACMT selalu di-logout.
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
         self.root.after(100, self._process_queue)
+
+    def _on_close(self):
+        """Logout sesi ACMT (wajib) lalu tutup aplikasi.
+
+        Logout best-effort: dijalankan di thread dengan batas tunggu pendek
+        supaya kegagalan/lambatnya server tidak membuat window menggantung.
+        """
+        if self.running:
+            # Operasi masih jalan: minta berhenti dulu supaya tidak ada request
+            # ACMT yang menabrak logout.
+            self.stop = True
+        try:
+            t = threading.Thread(
+                target=lambda: logout_sesi_simba(self.queue.put), daemon=True)
+            t.start()
+            t.join(timeout=8)
+        except Exception:
+            pass
+        self.root.destroy()
 
     # ── HEADER ────────────────────────────────────────────
 
@@ -169,13 +194,23 @@ class App(DialogMixin):
         inner = tb.Frame(header)
         inner.pack(fill=X, padx=15, pady=10)
 
-        title = tb.Label(
-            inner,
-            text="⚡ PLN Billing Analyzer",
-            font=("Segoe UI", 18, "bold"),
-            bootstyle=(INVERSE, PRIMARY),
-        )
-        title.pack(side=LEFT)
+        judul = tb.Frame(inner)
+        judul.pack(side=LEFT)
+
+        # Disimpan di atribut: tanpa referensi, PhotoImage dimakan garbage
+        # collector dan labelnya kosong.
+        self._logo_header = muat_logo(LOGO_EMBLEM_PATH, 48)
+        if self._logo_header:
+            tb.Label(judul, image=self._logo_header).pack(side=LEFT, padx=(0, 10))
+
+        teks = tb.Frame(judul)
+        teks.pack(side=LEFT)
+        tb.Label(
+            teks, text=APP_NAMA, font=("Segoe UI", 18, "bold"),
+        ).pack(anchor=W)
+        tb.Label(
+            teks, text=APP_SUBJUDUL, font=("Segoe UI", 9), bootstyle=INFO,
+        ).pack(anchor=W)
 
         btn_frame = tb.Frame(inner)
         btn_frame.pack(side=RIGHT)
@@ -827,6 +862,9 @@ class App(DialogMixin):
         self.stop = False
         self.billing_login_event.clear()
         self.billing_credentials_holder.cancel()
+        self.login_event.clear()
+        self.credentials_holder.cancel()
+        self._login_acmt_opsional = True
         self._error_occurred = False
         self._set_running(True)
         self.progress_bar["value"] = 0
@@ -850,6 +888,8 @@ class App(DialogMixin):
                 stop_flag=lambda: self.stop,
                 billing_login_event=self.billing_login_event,
                 billing_credentials_holder=self.billing_credentials_holder,
+                login_event=self.login_event,
+                credentials_holder=self.credentials_holder,
             )
             self.queue.put(("unduh_dlpd_done", stat))
         except Exception as e:
@@ -858,6 +898,7 @@ class App(DialogMixin):
 
     def _finish_unduh_dlpd(self, stat):
         self._set_running(False)
+        self._login_acmt_opsional = False
         self.eta_label.config(text="")
 
         if stat is None:
@@ -885,7 +926,25 @@ class App(DialogMixin):
                 f"(keterangan_dlpd-nya dibiarkan apa adanya)"
             )
         pesan.append("Kolom File DPM sudah terisi - tinggal tekan Jalankan.")
+        pesan.append(self._ringkasan_pagar(stat.get("pagar")))
         messagebox.showinfo("Unduh DLPD Selesai", "\n\n".join(pesan))
+
+    @staticmethod
+    def _ringkasan_pagar(pagar):
+        """Teks ringkas Daftar Pagar Terkunci untuk messagebox Unduh DLPD."""
+        if not pagar:
+            return "Daftar Pagar Terkunci: tidak dibuat."
+        if pagar.get("error"):
+            return f"Daftar Pagar Terkunci: tidak dibuat ({pagar['error']})."
+        r = pagar["per_riwayat"]
+        baris = [
+            f"Daftar Pagar Terkunci: {pagar['n_total']:,} pelanggan",
+            f"  Stand 1: {pagar['n_stand1']:,}   Kode akses: {pagar['n_akses']:,}",
+            f"  Pertama {r['PERTAMA KALI']:,} | 2x {r['2 KALI']:,} | "
+            f"3x {r['3 KALI']:,} | >3x {r['LEBIH DARI 3 KALI']:,}",
+        ]
+        baris.append(pagar["path"])
+        return "\n".join(baris)
 
 
     # ── QUEUE PROCESSING ──────────────────────────────────
@@ -918,7 +977,7 @@ class App(DialogMixin):
                         self.eta_label.config(text=f"ETA: {data}")
 
                 elif kind == "simba_login_required":
-                    self.status_label.config(text="Menunggu login SIMBA...", bootstyle=WARNING)
+                    self.status_label.config(text="Menunggu login ACMT...", bootstyle=WARNING)
                     self._show_simba_login_dialog()
 
                 elif kind == "billing_login_required":

@@ -1,5 +1,5 @@
 """
-Dialog-dialog UI PLN Billing Analyzer.
+Dialog-dialog UI SIMBA.
 
 Dipisah dari ui.py sebagai mixin, bukan sebagai fungsi lepas: seluruh metode di
 sini memakai atribut instance App (self.root, self.queue, self.status_label,
@@ -26,10 +26,30 @@ from config import (
     APP_NAMA,
     APP_PEMBUAT,
     APP_TAHUN,
+    APP_SUBJUDUL,
     APP_TEMPAT,
     APP_VERSI,
+    LOGO_PATH,
 )
 from core import settings
+
+
+def muat_logo(path, tinggi):
+    """PhotoImage logo setinggi `tinggi` px, atau None kalau tidak bisa dimuat.
+
+    None berarti tampilkan teks saja: logo cuma hiasan, jangan sampai file yang
+    tertinggal dari bundle membuat jendela gagal dibuka. Pemanggil WAJIB
+    menyimpan referensinya - PhotoImage yang dimakan garbage collector membuat
+    label jadi kosong tanpa error apa pun.
+    """
+    try:
+        from PIL import Image, ImageTk
+
+        with Image.open(path) as img:
+            lebar = max(1, round(img.width * tinggi / img.height))
+            return ImageTk.PhotoImage(img.resize((lebar, tinggi), Image.LANCZOS))
+    except Exception:
+        return None
 
 
 # Field yang diisi dalam PERSEN - dapat sufiks "%" di kanan kotak isian.
@@ -82,11 +102,31 @@ RULE_FIELD_GROUPS = [
      "pemakaian yang ditagih. Ditandai bila bedanya melewati toleransi ini.", [
         ("stand_tidak_wajar_toleransi", "Toleransi beda selisih stand vs pemakaian (kWh)"),
     ]),
+    ("Tagih Ulang Pasca Nol",
+     "Bulan lalu ditagih 0 kWh (biasanya kompensasi lebih tagih), bulan ini "
+     "ditagih lagi padahal stand tagihannya tidak didukung bacaan ACMT: stan "
+     "ACMT <= 1, atau stand tagihan melewati stan ACMT lebih dari batas ini. "
+     "Butuh data ACMT bulan ini (CSV Unduh DLPD atau sesi foto).", [
+        ("pasca_nol_toleransi_acmt", "Toleransi stand tagihan di atas stan ACMT (kWh)"),
+    ]),
     ("Cabut/Pasang Meter",
      "Saat ganti meter atau mutasi tarif, pemakaian dipecah dua segmen: "
      "(stand cabut - stand awal) + (stand kini - stand pasang). Ditandai bila "
      "hasilnya beda dari pemakaian yang ditagih.", [
         ("cabut_pasang_toleransi", "Toleransi beda pemakaian hitung vs ditagih (kWh)"),
+    ]),
+    ("Daftar Pagar Terkunci",
+     "Dibuat otomatis setelah Unduh DLPD. Pelanggan dengan stan meter ACMT "
+     "<= 1 dilaporkan, KECUALI stan lalunya di bawah batas ini (dianggap "
+     "meter baru). Perhatikan: pelanggan yang stand 1 terus tiap bulan juga "
+     "punya stan lalu kecil, jadi batas yang tinggi ikut membuang mereka.", [
+        ("pagar_stan_lalu_meter_baru", "Stan lalu di bawah ini dianggap meter baru (kWh)"),
+    ]),
+    ("Foto Meter",
+     "Biasanya foto hanya diunduh untuk pelanggan bukan Normal, cabut/pasang "
+     "bermasalah, dan pelanggan sheet PRIORITAS_KELAINAN. Isi 1 untuk "
+     "mengunduh foto SEMUA pelanggan termasuk Normal - jauh lebih lama.", [
+        ("foto_semua_pelanggan", "Unduh foto semua pelanggan (1 = ya, 0 = tidak)"),
     ]),
 ]
 
@@ -493,13 +533,59 @@ class DialogMixin:
 
         self.verify_event.set()
 
-    # ── SIMBA LOGIN DIALOG ────────────────────────────────
+    # ── KOLOM KODE ENKRIPSI (dipakai login ACMT & billing) ──
+
+    def _buat_field_kode_enkripsi(self, frm):
+        """Label + tombol Tempel + entry tersamar + petunjuk. Return StringVar-nya.
+
+        Harus di dalam frame yang memakai `pack`.
+        """
+        kode_head = tb.Frame(frm)
+        kode_head.pack(fill=X)
+        tb.Label(kode_head, text="Kode Enkripsi", font=("Segoe UI", 9)).pack(side=LEFT)
+
+        # Entry, bukan Text: widget Text tidak punya opsi `show`, jadi isinya
+        # tidak bisa disamarkan. Kodenya panjang (±500 karakter) sehingga
+        # kotaknya menggulir mendatar - itu wajar dan tidak mengganggu karena
+        # isinya di-paste, bukan diketik.
+        kode_var = tk.StringVar()
+        kode_entry = tb.Entry(frm, textvariable=kode_var, show="*", width=44)
+        kode_entry.pack(fill=X, pady=(2, 2))
+
+        def _tempel():
+            try:
+                isi = self.root.clipboard_get()
+            except tk.TclError:
+                return
+            kode_var.set(isi.strip())
+
+        tb.Button(
+            kode_head, text="Tempel", command=_tempel, bootstyle=(INFO, OUTLINE), width=9
+        ).pack(side=RIGHT)
+
+        tb.Label(
+            frm,
+            text="Tempel kode dari generator Anda. Kode ini dibuat ulang setiap "
+                 "kali login, jadi tidak disimpan aplikasi.",
+            font=("Segoe UI", 8, "italic"),
+            bootstyle=SECONDARY,
+            wraplength=430,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(0, 12))
+
+        return kode_var
+
+    # ── ACMT LOGIN DIALOG ─────────────────────────────────
 
     def _show_simba_login_dialog(self):
-        """Modal dialog untuk input kredensial SIMBA. Blocking sampai user submit/cancel."""
+        """Dialog kredensial ACMT (gateway FSM). Blocking sampai user submit/cancel.
+
+        Di UI server ini selalu disebut ACMT, bukan SIMBA - SIMBA sudah jadi nama
+        aplikasi. Nama metode tetap `simba` karena riwayat kodenya.
+        """
 
         dialog = tb.Toplevel(self.root)
-        dialog.title("Login SIMBA")
+        dialog.title("Login ACMT")
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.resizable(False, False)
@@ -509,57 +595,51 @@ class DialogMixin:
 
         tb.Label(
             frm,
-            text="Login SIMBA",
-            font=("Segoe UI", 14, "bold"),
+            text="Login ACMT",
+            font=("Segoe UI", 13, "bold"),
             bootstyle=PRIMARY,
-        ).grid(row=0, column=0, columnspan=2, sticky=W, pady=(0, 4))
+        ).pack(anchor=W, pady=(0, 4))
 
         tb.Label(
             frm,
-            text="Masukkan kredensial SIMBA Anda untuk mengambil data foto meter.",
+            text=("Dipakai untuk Daftar Pagar Terkunci (stand 1 + kode baca). "
+                  "Cancel = file DLPD tetap jadi, daftar tidak dibuat. "
+                  if getattr(self, "_login_acmt_opsional", False) else
+                  "Dipakai untuk mengambil foto meter dan database stan baca. ")
+                 + "Sesi otomatis logout setelah unduhan selesai.",
             font=("Segoe UI", 9),
             bootstyle=SECONDARY,
-            wraplength=320,
-        ).grid(row=1, column=0, columnspan=2, sticky=W, pady=(0, 12))
+            wraplength=430,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(0, 12))
 
-        tb.Label(frm, text="Username:", font=("Segoe UI", 10)).grid(
-            row=2, column=0, sticky=W, pady=4
-        )
+        tb.Label(frm, text="Username", font=("Segoe UI", 9)).pack(anchor=W)
         username_var = tk.StringVar()
-        user_entry = tb.Entry(
-            frm, textvariable=username_var, font=("Segoe UI", 10), width=28
-        )
-        user_entry.grid(row=2, column=1, sticky=EW, pady=4, padx=(8, 0))
-
-        tb.Label(frm, text="Password:", font=("Segoe UI", 10)).grid(
-            row=3, column=0, sticky=W, pady=4
-        )
-        password_var = tk.StringVar()
-        pass_entry = tb.Entry(
-            frm,
-            textvariable=password_var,
-            font=("Segoe UI", 10),
-            width=28,
-            show="•",
-        )
-        pass_entry.grid(row=3, column=1, sticky=EW, pady=4, padx=(8, 0))
-
-        hint = tb.Label(
+        user_entry = tb.Entry(frm, textvariable=username_var, width=44)
+        user_entry.pack(fill=X, pady=(2, 2))
+        tb.Label(
             frm,
             text="Format: 12345.namauser (5 digit unitup + nama)",
             font=("Segoe UI", 8, "italic"),
             bootstyle=SECONDARY,
-        )
-        hint.grid(row=4, column=0, columnspan=2, sticky=W, pady=(2, 12))
+        ).pack(anchor=W, pady=(0, 8))
+
+        tb.Label(frm, text="Password", font=("Segoe UI", 9)).pack(anchor=W)
+        password_var = tk.StringVar()
+        pass_entry = tb.Entry(frm, textvariable=password_var, show="•", width=44)
+        pass_entry.pack(fill=X, pady=(2, 8))
+
+        kode_var = self._buat_field_kode_enkripsi(frm)
 
         btn_frame = tb.Frame(frm)
-        btn_frame.grid(row=5, column=0, columnspan=2, sticky=EW)
+        btn_frame.pack(fill=X)
 
         result = {"submitted": False}
 
         def submit():
             u = username_var.get().strip()
             p = password_var.get()
+            k = kode_var.get().strip()
             if not u or not p:
                 messagebox.showwarning(
                     "Peringatan",
@@ -567,13 +647,22 @@ class DialogMixin:
                     parent=dialog,
                 )
                 return
-            self.credentials_holder.set(u, p)
+            if not k:
+                messagebox.showwarning(
+                    "Peringatan", "Kode enkripsi tidak boleh kosong.", parent=dialog
+                )
+                return
+            self.credentials_holder.set(u, p, k)
             result["submitted"] = True
             dialog.destroy()
 
         def cancel():
             self.credentials_holder.cancel()
-            self.stop = True
+            # Saat Unduh DLPD, login ACMT hanya untuk stand 1 di daftar pagar
+            # terkunci: batal login berarti lanjut tanpa stand 1, bukan
+            # membatalkan seluruh proses.
+            if not getattr(self, "_login_acmt_opsional", False):
+                self.stop = True
             dialog.destroy()
 
         tb.Button(
@@ -702,7 +791,7 @@ class DialogMixin:
             if kurang_rek:
                 rincian.append(f"{len(kurang_rek)} bulan rekening (portal billing)")
             if kurang_sb:
-                rincian.append(f"{len(kurang_sb)} bulan stan baca (SIMBA)")
+                rincian.append(f"{len(kurang_sb)} bulan stan baca (ACMT)")
             tb.Label(
                 frm,
                 text="Tekan Update Database untuk mengunduh " + " dan ".join(rincian)
@@ -783,7 +872,7 @@ class DialogMixin:
         user_entry.pack(fill=X, pady=(2, 2))
         tb.Label(
             frm,
-            text="NIP portal billing, mis. 9716018H2Y - beda dari username SIMBA.",
+            text="NIP portal billing, mis. 9716018H2Y - beda dari username ACMT.",
             font=("Segoe UI", 8, "italic"),
             bootstyle=SECONDARY,
         ).pack(anchor=W, pady=(0, 8))
@@ -793,38 +882,7 @@ class DialogMixin:
         pass_entry = tb.Entry(frm, textvariable=password_var, show="•", width=44)
         pass_entry.pack(fill=X, pady=(2, 8))
 
-        kode_head = tb.Frame(frm)
-        kode_head.pack(fill=X)
-        tb.Label(kode_head, text="Kode Enkripsi", font=("Segoe UI", 9)).pack(side=LEFT)
-
-        # Entry, bukan Text: widget Text tidak punya opsi `show`, jadi isinya
-        # tidak bisa disamarkan. Kodenya panjang (±500 karakter) sehingga
-        # kotaknya menggulir mendatar - itu wajar dan tidak mengganggu karena
-        # isinya di-paste, bukan diketik.
-        kode_var = tk.StringVar()
-        kode_entry = tb.Entry(frm, textvariable=kode_var, show="*", width=44)
-        kode_entry.pack(fill=X, pady=(2, 2))
-
-        def _tempel():
-            try:
-                isi = self.root.clipboard_get()
-            except tk.TclError:
-                return
-            kode_var.set(isi.strip())
-
-        tb.Button(
-            kode_head, text="Tempel", command=_tempel, bootstyle=(INFO, OUTLINE), width=9
-        ).pack(side=RIGHT)
-
-        tb.Label(
-            frm,
-            text="Tempel kode dari generator Anda. Kode ini dibuat ulang setiap "
-                 "kali login, jadi tidak disimpan aplikasi.",
-            font=("Segoe UI", 8, "italic"),
-            bootstyle=SECONDARY,
-            wraplength=430,
-            justify=LEFT,
-        ).pack(anchor=W, pady=(0, 12))
+        kode_var = self._buat_field_kode_enkripsi(frm)
 
         result = {"submitted": False}
 
@@ -1000,10 +1058,24 @@ class DialogMixin:
         frm = tb.Frame(dialog, padding=24)
         frm.pack(fill=BOTH, expand=True)
 
-        tb.Label(
-            frm, text="⚡ " + APP_NAMA, font=("Segoe UI", 15, "bold"),
-            bootstyle=PRIMARY,
-        ).pack(anchor=CENTER)
+        logo = muat_logo(LOGO_PATH, 160)
+        if logo:
+            # Kartu putih: tulisan subjudul di logo berwarna navy dan tenggelam
+            # di latar tema gelap. Logonya memang dirancang di atas putih.
+            # autostyle=False wajib: ttkbootstrap menimpa bg widget tk dengan
+            # warna tema, sehingga tanpa itu kartunya ikut gelap.
+            lbl_logo = tk.Label(frm, image=logo, bg="white", padx=16, pady=10,
+                                autostyle=False)
+            lbl_logo.image = logo
+            lbl_logo.pack(anchor=CENTER)
+        else:
+            tb.Label(
+                frm, text=APP_NAMA, font=("Segoe UI", 15, "bold"),
+                bootstyle=PRIMARY,
+            ).pack(anchor=CENTER)
+            tb.Label(
+                frm, text=APP_SUBJUDUL, font=("Segoe UI", 9),
+            ).pack(anchor=CENTER)
 
         tb.Label(
             frm, text=f"Versi {APP_VERSI}",

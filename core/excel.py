@@ -6,14 +6,14 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.formatting.rule import FormulaRule
 
-from core.analyzer import STATUS_JAM_TINGGI
+from core.analyzer import STATUS_JAM_TINGGI, STATUS_PASCA_NOL
 from core.cabut_pasang import (
     KOLOM_CABUT_PASANG,
     MASALAH_CABUT,
     MASALAH_PASANG,
     MASALAH_SELISIH,
 )
-from core.loader import kelainan_meter
+from core.pagar_terkunci import KODE_PRIORITAS, huruf_kode_baca
 from core.koreksi import (
     ALASAN_MAP,
     PILIHAN_BELUM_PDL,
@@ -277,24 +277,24 @@ def export_excel(df, output_file, bulan_list, klasifikasi=None, ocr_results=None
     # =========================
     # SHEET PRIORITAS KELAINAN
     # =========================
-    kel_filter = [
-        "ANJING GALAK","STAN DARI PELANGGAN","KWH METER TIDAK ADA",
-        "RUMAH KOSONG","PEMADAMAN","BENCANA","KWH METER MACET",
-        "KWH METER BURAM/PECAH","KWH METER DIDALAM BANGUNAN",
-        "KWH METER TINGGI"
-    ]
-
-    # Cocokkan ke segmen kelainan_bc_meter, bukan ke seluruh KELAINAN: nilai
-    # gabungannya "RUMAH KOSONG | K KWH NOL", yang tidak akan pernah sama
-    # dengan "RUMAH KOSONG" lewat isin(). Sebelum kolom gabungan ada, filter
-    # ini tidak pernah cocok sama sekali dan sheet-nya tidak pernah terbentuk.
-    df_kel = df[kelainan_meter(df["KELAINAN"]).isin(kel_filter)]
+    # Anggota sheet ditentukan KD BACA ACMT (kode yang diinput petugas baca),
+    # bukan kelainan_bc_meter billing - dua sumber itu bisa berbeda untuk
+    # pelanggan yang sama. Kolom KELAINAN (billing) tetap tampil apa adanya;
+    # KD BACA ACMT ditaruh di sebelahnya supaya keduanya terlihat. Tanpa kolom
+    # KD_BACA_ACMT (ACMT tidak tersedia) sheet ini tidak dibuat.
+    if "KD_BACA_ACMT" in df.columns:
+        huruf = df["KD_BACA_ACMT"].fillna("").map(huruf_kode_baca)
+        df_kel = df[huruf.isin(KODE_PRIORITAS)]
+    else:
+        df_kel = df.iloc[0:0]
 
     if not df_kel.empty:
 
         df_kel = df_kel.sort_values(by="JAM_NYALA", ascending=False)
 
         data_out = _build_sheet_data(df_kel, bulan_list, include_status=True)
+        data_out.insert(data_out.columns.get_loc("KELAINAN") + 1,
+                        "KD BACA ACMT", df_kel["KD_BACA_ACMT"].values)
 
         data_out.to_excel(writer, sheet_name="PRIORITAS_KELAINAN", index=False)
         sheet_map["PRIORITAS_KELAINAN"] = data_out
@@ -435,7 +435,8 @@ def export_excel(df, output_file, bulan_list, klasifikasi=None, ocr_results=None
     summary_data.append(["STATUS", "JUMLAH", "%"])
     for status_name in ["Normal","Stand Minus","Meter Macet","Kenaikan",
                         "Penurunan",STATUS_JAM_TINGGI,
-                        "Trend Naik","Stand Tidak Wajar","DATA BARU"]:
+                        "Trend Naik","Stand Tidak Wajar",STATUS_PASCA_NOL,
+                        "DATA BARU"]:
         cnt = status_counts.get(status_name, 0)
         pct = round(cnt / total * 100, 1) if total > 0 else 0
         summary_data.append([status_name, cnt, pct])
@@ -539,6 +540,7 @@ def format_excel(output_file, sheet_map, results, bulan_list, ocr_results=None, 
         "Meter Macet": PatternFill(start_color="FFCC99", fill_type="solid"),
         "Kenaikan": PatternFill(start_color="99CCFF", fill_type="solid"),
         "Penurunan": PatternFill(start_color="CCCCFF", fill_type="solid"),
+        STATUS_PASCA_NOL: PatternFill(start_color="FFE699", fill_type="solid"),
     }
 
 
@@ -778,11 +780,16 @@ def format_excel(output_file, sheet_map, results, bulan_list, ocr_results=None, 
 
                     if idpel in results and idx in results[idpel]:
 
-                        img = Image(results[idpel][idx])
-                        img.width = 260
-                        img.height = 250
+                        try:
+                            img = Image(results[idpel][idx])
+                        except (OSError, ValueError):
+                            # File rusak/bukan gambar: lewati sel ini saja,
+                            # jangan gagalkan seluruh laporan.
+                            img = None
 
-                        if blth in col_map:
+                        if img is not None and blth in col_map:
+                            img.width = 260
+                            img.height = 250
                             ws.add_image(img, f"{col_map[blth]}{row_idx}")
 
         # =========================

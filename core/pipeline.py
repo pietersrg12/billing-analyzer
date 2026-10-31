@@ -2,11 +2,15 @@
 Pipeline orchestrator.
 
 Flow:
-  LOAD -> PREPARE -> ANALYZE -> SIMBA AUTH -> INFO -> DOWNLOAD -> EXPORT -> FORMAT
+  LOAD -> PREPARE -> ANALYZE -> ACMT AUTH -> INFO -> DOWNLOAD -> EXPORT -> FORMAT
 """
 
+import glob
 import json
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import pandas as pd
@@ -21,6 +25,7 @@ from config import (
     ENABLE_DIGIT_READER,
     ENABLE_PHOTO_DOWNLOAD,
     ENABLE_STAN_BACA,
+    ENABLE_UNDUH_PARALEL,
     FOTO_DIR,
     HASIL_DIR,
     JUMLAH_BULAN_FOTO,
@@ -39,6 +44,7 @@ from core.analyzer import (
     apply_analysis,
     compute_stanbaca_comparison,
     prepare,
+    tandai_tagih_ulang_pasca_nol,
 )
 from core.cabut_pasang import compute_cabut_pasang, ringkasan as ringkasan_cabut_pasang
 from core.classifier import classify_all, is_available as classifier_available
@@ -53,6 +59,8 @@ from core.db_updater import (
     parse_kode_baca_export,
 )
 from core.dlpd_merge import gabung_dlpd_dpm
+from core import pagar_terkunci as pt
+from core.pagar_terkunci import parse_acmt_lengkap
 from core.loader import (
     _read_excel_auto,
     load_data,
@@ -66,25 +74,18 @@ from core.simba_client import SimbaAuthError, SimbaClient, SimbaError
 
 
 def unit_dari_token():
-    """Unit dari token tersimpan: billing dulu, lalu SIMBA. None kalau belum ada.
+    """Unit dari token billing tersimpan. None kalau belum ada.
 
     Dipakai saat belum ada file DPM yang dipilih (mis. tombol Cek Database).
-    Token billing menyimpan unitup secara eksplisit; token SIMBA hanya punya
-    username berformat "44320.nama", jadi diambil awalannya.
+    ACMT tidak ikut dibaca: sesinya selalu di-logout sehingga tidak ada token
+    yang tersimpan - unit dari login ACMT sudah dicatat lewat
+    settings.set_unit_aktif().
     """
     try:
         with open(BILLING_TOKEN_FILE, "r", encoding="utf-8") as f:
             u = json.load(f).get("unitup")
         if u:
             return str(u).strip()
-    except (OSError, ValueError, AttributeError):
-        pass
-    try:
-        with open(SIMBA_TOKEN_FILE, "r", encoding="utf-8") as f:
-            nama = json.load(f).get("username") or ""
-        awalan = str(nama).split(".")[0].strip()
-        if awalan:
-            return awalan
     except (OSError, ValueError, AttributeError):
         pass
     return None
@@ -94,7 +95,7 @@ def _catat_unit_login(unit, sumber, log=None):
     """Jadikan unit hasil login sebagai unit aktif.
 
     Kalau berbeda dari unit yang tersimpan, itu dicatat - bukan diganti
-    diam-diam. Beda unit antara SIMBA dan portal billing adalah keanehan yang
+    diam-diam. Beda unit antara ACMT dan portal billing adalah keanehan yang
     patut dilihat orang, bukan diselesaikan tanpa jejak.
     """
     if not unit:
@@ -136,72 +137,206 @@ def unit_untuk_dpm(dpm_path, log=None):
     return unit
 
 
-def _get_simba_client(
-    df_anomali, blth, progress_callback, login_event, credentials_holder
-):
-    """Setup SIMBA client. Reuse cached token kalau valid, kalau tidak minta login GUI.
+# Sesi ACMT di-cache di memori selama aplikasi terbuka: satu login dipakai
+# ulang oleh semua operasi (Unduh/Jalankan/Update), bukan login tiap tombol.
+# Login ulang hanya terjadi kalau server menolak token (via `_kerja_simba`),
+# dan logout dilakukan SEKALI saat aplikasi ditutup (`logout_sesi_simba`,
+# dipanggil UI di handler close). Token/token_info tetap hanya di memori.
+_sesi_simba = None
+_sesi_simba_lock = threading.Lock()
 
-    `df_anomali` boleh None (dipakai update database, yang jalan tanpa DPM
-    dimuat). Tanpa DPM tidak ada IDPEL untuk memprobe token, jadi token
-    tersimpan langsung dipakai dan biar request aslinya yang melempar
-    SimbaAuthError kalau ternyata sudah kedaluwarsa - caller menangkapnya,
-    menghapus token, lalu meminta login ulang.
+
+def _get_simba_client(progress_callback, login_event, credentials_holder):
+    """Kembalikan client ACMT yang masih login, atau login baru lewat dialog GUI.
+
+    Di teks UI/log server ini disebut ACMT (SIMBA sudah jadi nama aplikasi);
+    identifier kodenya tetap `simba` karena riwayat.
+
+    Client disimpan di `_sesi_simba` dan dipakai ulang antar operasi selama
+    aplikasi terbuka, jadi tidak login tiap tombol. Pemanggil TIDAK boleh
+    logout per-operasi; sesi ditutup sekali lewat `logout_sesi_simba` saat app
+    ditutup, atau di-reset oleh `_kerja_simba` kalau token ditolak server.
     """
+    global _sesi_simba
 
     def log(msg):
         if progress_callback:
             progress_callback(("log", msg))
 
-    client = SimbaClient(SIMBA_BASE_URL)
+    with _sesi_simba_lock:
+        if _sesi_simba is not None and getattr(_sesi_simba, "token", None):
+            return _sesi_simba
 
-    # Coba pakai token tersimpan
-    if client.load_token(SIMBA_TOKEN_FILE):
-        log(f"Coba pakai token tersimpan ({client.username})...")
+        # Sisa versi lama yang masih menyimpan token: dibuang supaya tidak
+        # terbaca sebagai unit atau dikira sesi yang masih hidup.
+        _hapus_token(SIMBA_TOKEN_FILE)
 
-        # Probe pakai IDPEL pertama dari data anomali (atau df asal kalau kosong)
-        probe_idpel = None
-        if df_anomali is not None and not df_anomali.empty:
-            probe_idpel = str(df_anomali["IDPEL"].iloc[0])
+        if login_event is None or credentials_holder is None:
+            raise SimbaAuthError(
+                "Tidak ada mekanisme login (login_event/credentials_holder None)"
+            )
 
-        if probe_idpel is None:
-            log("Token dipakai tanpa probe (tidak ada IDPEL untuk diuji)")
-            return client
+        if progress_callback:
+            progress_callback(("simba_login_required", None))
 
-        if client.probe(probe_idpel, blth):
-            log("Token valid")
-            return client
+        login_event.wait()
+        login_event.clear()
 
-        log("Token expired atau invalid, perlu login ulang")
+        creds = credentials_holder.get()
+        if not creds:
+            raise SimbaAuthError("Login dibatalkan oleh user")
 
-    # Minta login via UI
-    if login_event is None or credentials_holder is None:
-        raise SimbaAuthError(
-            "Tidak ada mekanisme login (login_event/credentials_holder None)"
-        )
+        username = creds.get("username", "").strip()
+        password = creds.get("password", "")
+        token_info = (creds.get("token_info") or "").strip()
 
-    if progress_callback:
-        progress_callback(("simba_login_required", None))
+        if not username or not password:
+            raise SimbaAuthError("Username/password kosong")
+        if not token_info:
+            raise SimbaAuthError("Kode enkripsi ACMT kosong")
 
-    login_event.wait()
-    login_event.clear()
+        log(f"Login ke ACMT sebagai {username}...")
+        client = SimbaClient(SIMBA_BASE_URL)
+        client.login(username, password, token_info)
+        _catat_unit_login(client.unitup, "ACMT", log)
+        log("Login ACMT berhasil")
 
-    creds = credentials_holder.get()
-    if not creds:
-        raise SimbaAuthError("Login dibatalkan oleh user")
+        _sesi_simba = client
+        return client
 
-    username = creds.get("username", "").strip()
-    password = creds.get("password", "")
 
-    if not username or not password:
-        raise SimbaAuthError("Username/password kosong")
+def _reset_sesi_simba(logout=False, log=None):
+    """Lepas sesi ACMT yang tercache. `logout=True` menutup sesi di server dulu
+    (best-effort); dipakai saat aplikasi ditutup. Tanpa logout dipakai saat token
+    sudah mati (sudah tidak sah di server, jadi tidak perlu dilogout)."""
+    global _sesi_simba
+    with _sesi_simba_lock:
+        client = _sesi_simba
+        _sesi_simba = None
+    if client is not None and logout:
+        try:
+            _logout_simba(client, log or (lambda m: None))
+        except Exception:
+            pass
 
-    log(f"Login ke SIMBA sebagai {username}...")
-    client.login(username, password)
-    client.save_token(SIMBA_TOKEN_FILE)
-    _catat_unit_login(client.unitup, "SIMBA", log)
-    log("Login SIMBA berhasil")
 
-    return client
+def logout_sesi_simba(progress_callback=None):
+    """Logout sesi ACMT saat aplikasi ditutup. WAJIB dipanggil di handler close.
+    No-op kalau tidak ada sesi; tidak pernah raise."""
+    def log(msg):
+        if progress_callback:
+            progress_callback(("log", msg))
+    _reset_sesi_simba(logout=True, log=log)
+
+
+def _kerja_simba(kerja, progress_callback, login_event, credentials_holder):
+    """Jalankan kerja(client) dengan client ACMT tercache; kalau token ditolak
+    server, lepas cache, login ulang (dialog), lalu ulangi sekali.
+
+    Meniru `_kerja_billing`: masa berlaku token ACMT tidak bisa dicek lokal, jadi
+    satu-satunya tanda token mati adalah request yang gagal auth."""
+    client = _get_simba_client(progress_callback, login_event, credentials_holder)
+    try:
+        return kerja(client)
+    except SimbaAuthError as e:
+        if progress_callback:
+            progress_callback(("log", f"Token ACMT ditolak server: {e}"))
+            progress_callback(("log", "Minta login ACMT ulang..."))
+        _reset_sesi_simba(logout=False)
+        client = _get_simba_client(progress_callback, login_event, credentials_holder)
+        # Gagal lagi setelah token baru berarti bukan soal token - biarkan naik.
+        return kerja(client)
+
+
+def _target_foto(df, cfg):
+    """Baris yang fotonya diunduh. `attrs['cakupan']` = keterangan untuk log.
+
+    Default: STATUS bukan Normal, plus cabut/pasang bermasalah dan pelanggan
+    PRIORITAS_KELAINAN (KD BACA ACMT) walau STATUS-nya Normal - tanpa foto,
+    pemeriksa tidak bisa memastikan apa pun. Saklar `foto_semua_pelanggan`
+    (Pengaturan Rule, default 0) mengunduh foto semua pelanggan.
+    """
+    if float(cfg.get("foto_semua_pelanggan", 0) or 0) >= 1:
+        mask = pd.Series(True, index=df.index)
+        cakupan = "SEMUA pelanggan - saklar foto semua aktif"
+    else:
+        mask = df["STATUS"] != "Normal"
+        if "MASALAH_CABUT_PASANG" in df.columns:
+            mask = mask | (df["MASALAH_CABUT_PASANG"] != "")
+        if "KD_BACA_ACMT" in df.columns:
+            huruf = df["KD_BACA_ACMT"].fillna("").map(pt.huruf_kode_baca)
+            mask = mask | huruf.isin(pt.KODE_PRIORITAS)
+        cakupan = "non-Normal + cabut/pasang bermasalah + prioritas KD BACA"
+    df_foto = df[mask].copy()
+    df_foto["IDPEL"] = df_foto["IDPEL"].astype(str)
+    df_foto.attrs["cakupan"] = cakupan
+    return df_foto
+
+
+def _tempel_kd_baca(df, acmt, blth, cfg, log):
+    """Tambah kolom KD_BACA_ACMT (label, mis. 'E-RUMAH TUTUP') dan
+    STAN_METER_ACMT dari data ACMT, lalu jalankan rule Tagih Ulang Pasca Nol
+    yang butuh stan ACMT itu."""
+    d = acmt.drop_duplicates(subset=["IDPEL"], keep="first").set_index("IDPEL")
+    peta = d["KD BACA"].map(pt.label_kode_baca)
+    df = df.copy()
+    kunci = pt._idpel12(df["IDPEL"].astype(str))
+    df["KD_BACA_ACMT"] = kunci.map(peta).fillna("").values
+    df["STAN_METER_ACMT"] = kunci.map(d["STAN METER"]).values
+    huruf = df["KD_BACA_ACMT"].map(pt.huruf_kode_baca)
+    log(f"KD BACA ACMT: {int((df['KD_BACA_ACMT'] != '').sum()):,} dari {len(df):,} "
+        f"pelanggan terpetakan, {int(huruf.isin(pt.KODE_PRIORITAS).sum()):,} "
+        f"masuk PRIORITAS_KELAINAN")
+    df, n = tandai_tagih_ulang_pasca_nol(df, blth, cfg)
+    log(f"Tagih Ulang Pasca Nol: {n:,} pelanggan (bulan lalu 0 kWh, stand "
+        f"tagihan tidak didukung stan ACMT)")
+    return df
+
+
+def _tempel_kd_baca_csv(df, blth, unit, cfg, log):
+    """KD BACA dari CSV ACMT terbaru yang disimpan Unduh DLPD. Return (df, ada)."""
+    pola = os.path.join(UNDUHAN_DIR, str(unit), str(blth), f"ACMT_KodeBaca_{blth}_*.csv")
+    files = glob.glob(pola)
+    if not unit or not files:
+        return df, False
+    terbaru = max(files, key=os.path.getmtime)
+    try:
+        acmt = _baca_csv_acmt(terbaru)
+    except Exception as e:
+        log(f"CSV ACMT {os.path.basename(terbaru)} tidak terbaca ({e}) - diunduh ulang")
+        return df, False
+    log(f"KD BACA ACMT dari {os.path.basename(terbaru)}")
+    return _tempel_kd_baca(df, acmt, blth, cfg, log), True
+
+
+def _tempel_kd_baca_unduh(df, blth, unit, client, stop_flag, cfg, log):
+    """KD BACA diunduh di sesi ACMT yang sudah login. Gagal -> df apa adanya
+    (sheet PRIORITAS_KELAINAN tidak dibuat; tidak jatuh ke kelainan billing)."""
+    log(f"Unduh kode baca ACMT {blth} (untuk sheet PRIORITAS_KELAINAN)...")
+    try:
+        acmt = _unduh_acmt_bulan(client, blth, log, stop_flag)
+    except _Dibatalkan:
+        return df
+    except Exception as e:
+        log(f"Kode baca ACMT gagal diunduh ({e}) - sheet PRIORITAS_KELAINAN dan "
+            f"rule Tagih Ulang Pasca Nol dilewati")
+        return df
+    if unit:
+        folder = os.path.join(UNDUHAN_DIR, str(unit), str(blth))
+        os.makedirs(folder, exist_ok=True)
+        acmt.to_csv(os.path.join(folder, f"ACMT_KodeBaca_{blth}_{_stempel_waktu()}.csv"),
+                    index=False, encoding="utf-8-sig")
+    return _tempel_kd_baca(df, acmt, blth, cfg, log)
+
+
+def _logout_simba(client, log):
+    """Tutup sesi ACMT. Kegagalan hanya dicatat: unduhan yang sudah selesai
+    tidak boleh ikut dianggap gagal gara-gara logout."""
+    ok, pesan = client.logout()
+    if ok:
+        log("Logout ACMT berhasil")
+    else:
+        log(f"Logout ACMT gagal (diabaikan): {pesan}")
 
 
 def run_pipeline(
@@ -297,6 +432,13 @@ def run_pipeline(
 
     if stanbaca_db is not None:
         df = compute_stanbaca_comparison(df, stanbaca_db, blth, cfg)
+        if "STAND_BACA_LALU" in df.columns:
+            n_tanpa = int(df["STAND_BACA_LALU"].isna().sum())
+            if n_tanpa:
+                bulan_lalu = (pd.Period(str(blth), freq="M") - 1).strftime("%Y%m")
+                log(f"PERINGATAN: stan baca {bulan_lalu} tidak ada untuk "
+                    f"{n_tanpa:,} dari {len(df):,} pelanggan - PEMAKAIAN_ASLI "
+                    f"mereka dikosongkan. Update database stan baca.")
 
     df = compute_cabut_pasang(df, cfg)
     n_cp, n_cp_masalah = ringkasan_cabut_pasang(df)
@@ -310,27 +452,26 @@ def run_pipeline(
         return
 
     # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ FILTER UNTUK FOTO Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-    # Stand cabut/pasang yang bermasalah tetap difoto walau STATUS-nya Normal:
-    # tanpa foto, pemeriksa tidak punya cara memastikan stand mana yang salah.
-    mask_foto = df["STATUS"] != "Normal"
-    if "MASALAH_CABUT_PASANG" in df.columns:
-        mask_foto = mask_foto | (df["MASALAH_CABUT_PASANG"] != "")
+    # KD BACA ACMT untuk sheet PRIORITAS_KELAINAN: dari CSV yang disimpan
+    # Unduh DLPD kalau ada; kalau belum, diunduh di sesi ACMT foto di bawah.
+    df, ada_kd = _tempel_kd_baca_csv(df, blth, unitup, cfg, log)
+    df_foto = _target_foto(df, cfg)
 
-    df_foto = df[mask_foto].copy()
-    df_foto["IDPEL"] = df_foto["IDPEL"].astype(str)
-
-    # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ SIMBA + DOWNLOAD FOTO + KLASIFIKASI Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+    # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ ACMT + DOWNLOAD FOTO + KLASIFIKASIÃ¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     results = {}
     bulan_list = []
     klasifikasi = {}
 
     if not ENABLE_PHOTO_DOWNLOAD:
-        log("Download foto DINONAKTIFKAN (ENABLE_PHOTO_DOWNLOAD=False) - skip SIMBA & klasifikasi")
+        log("Download foto DINONAKTIFKAN (ENABLE_PHOTO_DOWNLOAD=False) - skip ACMT & klasifikasi")
+        if not ada_kd:
+            log("KD BACA ACMT tidak tersedia - sheet PRIORITAS_KELAINAN dan rule "
+                "Tagih Ulang Pasca Nol dilewati")
         percent(90)
     else:
         # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ SIMBA AUTH Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         simba_client = _get_simba_client(
-            df_foto, blth, progress_callback, login_event, credentials_holder
+            progress_callback, login_event, credentials_holder
         )
         percent(22)
 
@@ -338,9 +479,16 @@ def run_pipeline(
             log("Dibatalkan")
             return
 
+        # KD BACA belum ada dari CSV: unduh di sesi yang sama (tanpa login
+        # tambahan), lalu target foto dihitung ulang supaya pelanggan
+        # prioritas ikut difoto.
+        if not ada_kd:
+            df = _tempel_kd_baca_unduh(df, blth, unitup, simba_client, stop_flag, cfg, log)
+            df_foto = _target_foto(df, cfg)
+
         # Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ DOWNLOAD FOTO (info + download pipelined) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         n_target = len(df_foto)
-        log(f"AMBIL DATA & FOTO DARI SIMBA ({n_target} pelanggan non-Normal)")
+        log(f"AMBIL DATA & FOTO DARI ACMT ({n_target} pelanggan, {df_foto.attrs['cakupan']})")
         log(f"  Pipeline: INFO + DOWNLOAD jalan bersamaan (22-85%)")
 
         # State untuk throttle log: log tiap kelipatan 10% kemajuan gabungan
@@ -407,8 +555,8 @@ def run_pipeline(
                         f"ok={dl_ok} fail={dl_fail} ({pct_dl}%){eta_str}"
                     )
 
-        try:
-            results, bulan_list = download_photos(
+        def _kerja_download_foto(simba_client):
+            return download_photos(
                 df_foto,
                 simba_client,
                 blth,
@@ -419,17 +567,20 @@ def run_pipeline(
                 progress_callback=photo_progress,
                 stop_flag=stop_flag,
             )
+
+        try:
+            # Sesi ACMT TIDAK di-logout di sini: dipakai ulang antar operasi dan
+            # ditutup sekali saat aplikasi ditutup. Kalau token ditolak di tengah,
+            # _kerja_simba login ulang lalu mengulang download.
+            results, bulan_list = _kerja_simba(
+                _kerja_download_foto, progress_callback,
+                login_event, credentials_holder,
+            )
         except SimbaAuthError as e:
-            log(f"ERROR auth SIMBA: {e}")
-            # Hapus token agar next run minta login
-            try:
-                if os.path.exists(SIMBA_TOKEN_FILE):
-                    os.remove(SIMBA_TOKEN_FILE)
-            except OSError:
-                pass
+            log(f"ERROR auth ACMT: {e}")
             raise
         except SimbaError as e:
-            log(f"ERROR SIMBA: {e}")
+            log(f"ERROR ACMT: {e}")
             raise
 
         # Summary download
@@ -441,7 +592,7 @@ def run_pipeline(
         )
         if n_idpel_with_photo < n_target:
             n_missing = n_target - n_idpel_with_photo
-            log(f"  {n_missing} pelanggan TIDAK dapat foto (kemungkinan tidak ada di SIMBA)")
+            log(f"  {n_missing} pelanggan TIDAK dapat foto (kemungkinan tidak ada di ACMT)")
 
         percent(85)
 
@@ -547,8 +698,7 @@ def run_pipeline(
     df = tambah_saran_koreksi(df, cfg, klasifikasi)
     n_saran = (df["PILIHAN"] != "BIARKAN").sum()
     log(f"Saran koreksi stand otomatis: {n_saran} pelanggan (lihat sheet KOREKSI_STAND)")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = os.path.join(output_dir, f"hasil_analisa_{timestamp}.xlsx")
+    output_file = os.path.join(output_dir, f"hasil_analisa_{_stempel_waktu()}.xlsx")
     sheet_map = export_excel(df, output_file, bulan_list, klasifikasi, ocr_results)
 
     log("FORMAT EXCEL")
@@ -735,6 +885,15 @@ def _sufiks_kode(kode_list):
     return "_" + "".join(str(k).strip().upper() for k in kode_list)
 
 
+def _stempel_waktu():
+    """'20260913_194512' - penanda waktu untuk nama file hasil & unduhan.
+
+    Setiap unduhan diberi stempel supaya tarikan ulang periode yang sama tidak
+    menimpa file sebelumnya; riwayat file mentahnya tetap bisa ditelusuri.
+    """
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
 def _pastikan_unit_cocok(client, unit_diharapkan, sumber):
     """Tolak kalau unit login beda dari unit yang sedang dikerjakan.
 
@@ -764,6 +923,9 @@ def _unduh_rekening(bulan_list, progress_callback, stop_flag,
             progress_callback(("log", msg))
 
     frames = []
+    # Satu stempel per pemanggilan, di LUAR kerja: login ulang yang mengulang
+    # kerja memakai nama yang sama, bukan menyisakan setengah set file.
+    stempel = _stempel_waktu()
 
     def kerja(client):
         del frames[:]
@@ -780,9 +942,11 @@ def _unduh_rekening(bulan_list, progress_callback, stop_flag,
 
             folder = _folder_unduhan(client, bulan)
             os.makedirs(folder, exist_ok=True)
-            save_path = os.path.join(folder, f"Monitoring_Billing_Detail_{bulan}.xlsx")
+            save_path = os.path.join(
+                folder, f"Monitoring_Billing_Detail_{bulan}_{stempel}.xlsx")
             log(f"Unduh database rekening {bulan}...")
-            size = client.download_billing_detail(bulan, save_path, BILLING_EXPORT_SIZE)
+            size = client.download_billing_detail(
+                bulan, save_path, BILLING_EXPORT_SIZE, catat=log)
             log(f"  file diterima {size / 1048576:.1f} MB")
 
             df = parse_billing_export(save_path, bulan)
@@ -807,34 +971,36 @@ def _unduh_stanbaca(bulan_list, progress_callback, stop_flag,
         if progress_callback:
             progress_callback(("log", msg))
 
-    client = _get_simba_client(
-        None, bulan_list[0], progress_callback, login_event, credentials_holder
-    )
-    _pastikan_unit_cocok(client, unit_diharapkan, "SIMBA")
-    if unit is not None:
-        unit["unitup"] = client.unitup
+    # Sesi ACMT di-cache & dipakai ulang antar operasi (tidak logout di sini);
+    # _kerja_simba login ulang otomatis kalau token ditolak server.
+    def kerja(client):
+        _pastikan_unit_cocok(client, unit_diharapkan, "ACMT")
+        if unit is not None:
+            unit["unitup"] = client.unitup
 
-    frames = []
-    for bulan in bulan_list:
-        if stop_flag and stop_flag():
-            log("Dibatalkan")
-            return None
-
-        log(f"Unduh database stan baca {bulan}...")
-        n_bulan_ini = 0
-        for kdbaca in KODE_BACA_KATEGORI:
+        frames = []
+        for bulan in bulan_list:
             if stop_flag and stop_flag():
                 log("Dibatalkan")
                 return None
-            raw = client.download_kode_baca(bulan, kdbaca)
-            df = parse_kode_baca_export(raw, kdbaca)
-            n_bulan_ini += len(df)
-            log(f"  {kdbaca}: {len(df):,} baris")
-            if not df.empty:
-                frames.append(df)
-        log(f"  total {bulan}: {n_bulan_ini:,} baris")
 
-    return pd.concat(frames, ignore_index=True) if frames else None
+            log(f"Unduh database stan baca {bulan}...")
+            n_bulan_ini = 0
+            for kdbaca in KODE_BACA_KATEGORI:
+                if stop_flag and stop_flag():
+                    log("Dibatalkan")
+                    return None
+                raw = client.download_kode_baca(bulan, kdbaca)
+                df = parse_kode_baca_export(raw, kdbaca, bulan)
+                n_bulan_ini += len(df)
+                log(f"  {kdbaca}: {len(df):,} baris")
+                if not df.empty:
+                    frames.append(df)
+            log(f"  total {bulan}: {n_bulan_ini:,} baris")
+
+        return pd.concat(frames, ignore_index=True) if frames else None
+
+    return _kerja_simba(kerja, progress_callback, login_event, credentials_holder)
 
 
 def run_db_update(
@@ -868,7 +1034,7 @@ def run_db_update(
 
     hasil = {"rekening": None, "stanbaca": None}
     # Unit tiap sumber dicatat terpisah: rekening dari portal billing, stan baca
-    # dari SIMBA. Keduanya biasanya sama, tapi jangan diasumsikan - kalau user
+    # dari ACMT. Keduanya biasanya sama, tapi jangan diasumsikan - kalau user
     # login sebagai unit berbeda di dua sistem itu, masing-masing tetap harus
     # menulis ke database unitnya sendiri.
     unit_rek = {"unitup": None}
@@ -903,14 +1069,10 @@ def run_db_update(
     # ----- STAN BACA -----
     if bulan_stanbaca:
         log(f"=== DATABASE STAN BACA: {len(bulan_stanbaca)} bulan ===")
-        try:
-            df = _unduh_stanbaca(
-                bulan_stanbaca, progress_callback, stop_flag,
-                login_event, credentials_holder, unit_sb, unit_diharapkan,
-            )
-        except SimbaAuthError:
-            _hapus_token(SIMBA_TOKEN_FILE)
-            raise
+        df = _unduh_stanbaca(
+            bulan_stanbaca, progress_callback, stop_flag,
+            login_event, credentials_holder, unit_sb, unit_diharapkan,
+        )
         if df is None:
             return hasil
         percent(85)
@@ -951,8 +1113,14 @@ def run_unduh_dlpd(
     stop_flag=None,
     billing_login_event=None,
     billing_credentials_holder=None,
+    login_event=None,
+    credentials_holder=None,
 ):
     """Unduh export DLPD + DPM lalu gabungkan jadi satu file input.
+
+    Setelah itu otomatis membuat Daftar Pagar Terkunci (`stat["pagar"]`),
+    memakai login ACMT lewat `login_event`/`credentials_holder`. Login itu
+    opsional: kalau dibatalkan, file DLPD tetap jadi tapi daftar tidak dibuat.
 
     Dua file diperlukan karena export DLPD tidak membawa `kelainan_bc_meter`;
     kolom itu hanya ada di export DPM dan di-lookup lewat idpel.
@@ -978,6 +1146,10 @@ def run_unduh_dlpd(
     log(f"Kd Proses: {', '.join(kd_proses)}")
 
     jalur = {}
+    # Satu stempel untuk ketiga file (DLPD, DPM, gabungan) supaya satu set bisa
+    # ditelusuri bersama, dan dihitung di luar kerja agar login ulang tidak
+    # memecah set itu ke dua stempel.
+    stempel = _stempel_waktu()
 
     def kerja(client):
         """Unduh kedua export. Dipisah jadi fungsi supaya bisa diulang utuh
@@ -989,38 +1161,72 @@ def run_unduh_dlpd(
 
         folder = _folder_unduhan(client, blth)
         os.makedirs(folder, exist_ok=True)
+        jalur["unit"] = client.unitup
         sufiks = _sufiks_kode(kd_proses)
         jalur["dlpd"] = os.path.join(
-            folder, f"Monitoring_Dlpd_Detail_{blth}{sufiks}.xlsx")
+            folder, f"Monitoring_Dlpd_Detail_{blth}{sufiks}_{stempel}.xlsx")
         jalur["dpm"] = os.path.join(
-            folder, f"Monitoring_DPM_Detail_{blth}{sufiks}.xlsx")
+            folder, f"Monitoring_DPM_Detail_{blth}{sufiks}_{stempel}.xlsx")
         jalur["keluar"] = os.path.join(
-            folder, f"DLPD_{blth}{sufiks}_gabungan.xlsx")
-
-        log(f"Unduh export DLPD {blth} (unit {client.unitap}/{client.unitup})...")
-        percent(10)
-        n = client.download_dlpd_detail(
-            blth, kd_proses, jalur["dlpd"],
-            dlpd=setelan["dlpd"],
-            status_verifikasi=setelan["status_verifikasi_dlpd"],
-        )
-        log(f"  file DLPD diterima {n / 1048576:.1f} MB")
-        percent(40)
-
-        if stop_flag and stop_flag():
-            log("Dibatalkan")
-            return None
+            folder, f"DLPD_{blth}{sufiks}_gabungan_{stempel}.xlsx")
 
         # DPM ditarik dengan Kd Proses yang SAMA supaya setiap baris DLPD punya
         # peluang ketemu pasangannya; kalau pilihannya berbeda, sebagian baris
         # pasti tidak cocok bukan karena datanya memang tidak ada.
-        log(f"Unduh export DPM {blth} (untuk kolom kelainan_bc_meter)...")
-        n = client.download_dpm_detail(
-            blth, kd_proses, jalur["dpm"],
-            kodeposting=setelan["kodeposting_dpm"],
-        )
-        log(f"  file DPM diterima {n / 1048576:.1f} MB")
-        percent(70)
+        def unduh_dlpd():
+            n = client.download_dlpd_detail(
+                blth, kd_proses, jalur["dlpd"],
+                dlpd=setelan["dlpd"],
+                status_verifikasi=setelan["status_verifikasi_dlpd"],
+                catat=log,
+            )
+            log(f"  file DLPD diterima {n / 1048576:.1f} MB")
+            return n
+
+        def unduh_dpm():
+            n = client.download_dpm_detail(
+                blth, kd_proses, jalur["dpm"],
+                kodeposting=setelan["kodeposting_dpm"],
+                catat=log,
+            )
+            log(f"  file DPM diterima {n / 1048576:.1f} MB")
+            return n
+
+        if ENABLE_UNDUH_PARALEL:
+            # DLPD & DPM independen dan waktunya didominasi generate di server;
+            # dijalankan bersamaan pada client yang sama. BillingAuthError dari
+            # salah satunya sengaja digelembungkan keluar supaya _kerja_billing
+            # login ulang lalu menjalankan SELURUH kerja lagi (bukan disambung).
+            log(f"Unduh export DLPD + DPM {blth} paralel "
+                f"(unit {client.unitap}/{client.unitup})...")
+            percent(10)
+            with ThreadPoolExecutor(max_workers=2,
+                                    thread_name_prefix="unduh") as pool:
+                futs = {
+                    pool.submit(unduh_dlpd): "DLPD",
+                    pool.submit(unduh_dpm): "DPM",
+                }
+                selesai = 0
+                for fut in as_completed(futs):
+                    fut.result()  # re-raise; BillingAuthError naik ke _kerja_billing
+                    selesai += 1
+                    percent(40 if selesai == 1 else 70)
+        else:
+            log(f"Unduh export DLPD {blth} "
+                f"(unit {client.unitap}/{client.unitup})...")
+            percent(10)
+            unduh_dlpd()
+            percent(40)
+            if stop_flag and stop_flag():
+                log("Dibatalkan")
+                return None
+            log(f"Unduh export DPM {blth} (untuk kolom kelainan_bc_meter)...")
+            unduh_dpm()
+            percent(70)
+
+        if stop_flag and stop_flag():
+            log("Dibatalkan")
+            return None
         return True
 
     if _kerja_billing(kerja, progress_callback,
@@ -1045,6 +1251,331 @@ def run_unduh_dlpd(
         log(f"  {stat['n_tak_cocok']:,} baris tanpa pasangan di DPM "
             f"- keterangan_dlpd-nya dibiarkan apa adanya")
     log(f"File siap dipakai: {jalur['keluar']}")
+    percent(75)
+
+    # Daftar pagar terkunci menumpang di ujung alur. Apa pun yang terjadi di
+    # sini tidak boleh membuat file DLPD yang sudah jadi dianggap gagal.
+    stat["pagar"] = None
+    if stop_flag and stop_flag():
+        log("Dibatalkan - daftar pagar terkunci dilewati")
+    else:
+        try:
+            stat["pagar"] = _buat_pagar_terkunci(
+                blth, jalur["unit"], jalur["keluar"], stempel,
+                progress_callback, stop_flag, login_event, credentials_holder,
+                kd_proses,
+            )
+        except _Dibatalkan:
+            log("Dibatalkan - daftar pagar terkunci dilewati")
+            stat["pagar"] = {"error": "dibatalkan"}
+        except Exception as e:
+            log(f"ERROR daftar pagar terkunci: {e}")
+            stat["pagar"] = {"error": str(e)}
     percent(100)
 
     return stat
+
+
+# =========================
+# DAFTAR PAGAR TERKUNCI
+# =========================
+
+class _Dibatalkan(Exception):
+    """Operator menekan Batal saat daftar pagar terkunci dibuat."""
+
+
+def _cek_batal(stop_flag):
+    if stop_flag and stop_flag():
+        raise _Dibatalkan()
+
+
+def _coba_ulang(fungsi, label, log, stop_flag, jeda=(5, 15, 30)):
+    """Jalankan `fungsi`; SimbaError (5xx/putus) diulang dengan jeda.
+
+    SimbaAuthError tidak diulang - token mati tidak sembuh dengan menunggu.
+    Penantian dicek tiap 0,5 detik supaya tombol Batal tetap responsif.
+    """
+    for i in range(len(jeda) + 1):
+        _cek_batal(stop_flag)
+        try:
+            return fungsi()
+        except SimbaError as e:
+            if i == len(jeda):
+                raise
+            log(f"  {label} gagal ({e}); coba lagi {jeda[i]} dtk...")
+            batas = time.monotonic() + jeda[i]
+            while time.monotonic() < batas:
+                _cek_batal(stop_flag)
+                time.sleep(0.5)
+
+
+def _unduh_acmt_bulan(client, bulan, log, stop_flag):
+    """Satu bulan laporan kode baca ACMT, ketiga kategori -> DataFrame lengkap."""
+    frames = []
+    for kdbaca in KODE_BACA_KATEGORI:
+        raw = _coba_ulang(lambda: client.download_kode_baca(bulan, kdbaca),
+                          f"ACMT {bulan} {kdbaca}", log, stop_flag)
+        df = parse_acmt_lengkap(raw, kdbaca, bulan)
+        log(f"  ACMT {bulan} {kdbaca}: {len(df):,} baris")
+        frames.append(df)
+    return pt.rapikan_acmt(pd.concat(frames, ignore_index=True))
+
+
+def _baca_csv_acmt(path):
+    return pt.rapikan_acmt(pd.read_csv(path, dtype=str, encoding="utf-8-sig"))
+
+
+def _unduh_acmt_pagar(blth, unit, folder, stempel, progress_callback, stop_flag,
+                      login_event, credentials_holder, bulan_di_db=()):
+    """Satu sesi ACMT: BLTH ini + bulan lalu yang belum ada di mana pun.
+
+    Bulan di `bulan_di_db` sudah lengkap di database stan baca (yang juga
+    berasal dari ACMT), jadi tidak diunduh lagi.
+    Return (df_acmt_ini atau None, {bulan: df}, alasan_kalau_None).
+    """
+
+    def log(msg):
+        if progress_callback:
+            progress_callback(("log", msg))
+
+    # Bulan lampau tidak berubah: diunduh sekali lalu dibaca dari cache.
+    # Cache dibaca SEBELUM login supaya riwayat tetap ada walau login batal.
+    acmt_lalu = {}
+    cache_bulan = {}
+    for bln in pt.bulan_sebelumnya(blth):
+        cache = os.path.join(UNDUHAN_DIR, str(unit), bln, f"ACMT_KodeBaca_{bln}.csv")
+        if bln in bulan_di_db and not os.path.exists(cache):
+            continue
+        cache_bulan[bln] = cache
+        if os.path.exists(cache):
+            try:
+                acmt_lalu[bln] = _baca_csv_acmt(cache)
+                log(f"  ACMT {bln}: cache ({len(acmt_lalu[bln]):,} baris)")
+            except Exception as e:
+                log(f"  cache ACMT {bln} rusak ({e}) - unduh ulang")
+
+    try:
+        client = _get_simba_client(progress_callback, login_event, credentials_holder)
+    except (SimbaAuthError, SimbaError) as e:
+        log(f"Login ACMT tidak dilakukan ({e}) - ACMT bulan ini tidak ikut")
+        return None, acmt_lalu, f"login ACMT tidak dilakukan ({e})"
+
+    try:
+        if unit and client.unitup and str(client.unitup) != str(unit):
+            log(f"Login ACMT unit {client.unitup}, DLPD unit {unit} - ACMT tidak ikut")
+            return None, {}, f"unit ACMT {client.unitup} beda dari DLPD {unit}"
+
+        for bln, cache in cache_bulan.items():
+            _cek_batal(stop_flag)
+            if bln in acmt_lalu:
+                continue
+            try:
+                df = _unduh_acmt_bulan(client, bln, log, stop_flag)
+            except (SimbaAuthError, _Dibatalkan):
+                raise
+            except Exception as e:
+                log(f"  ACMT {bln} gagal diunduh ({e}) - riwayat bulan ini tanpa ACMT")
+                continue
+            acmt_lalu[bln] = df
+            # Bulan kosong (mis. di luar retensi server) tidak di-cache: cache
+            # kosong akan dipakai selamanya dan bulan itu tidak pernah diisi.
+            if df.empty:
+                log(f"  ACMT {bln} kosong - tidak di-cache")
+                continue
+            os.makedirs(os.path.dirname(cache), exist_ok=True)
+            df.to_csv(cache, index=False, encoding="utf-8-sig")
+
+        # BLTH ini selalu ditarik baru - baca susulan bisa masih masuk.
+        _cek_batal(stop_flag)
+        try:
+            acmt_ini = _unduh_acmt_bulan(client, blth, log, stop_flag)
+        except (SimbaError, ValueError) as e:
+            log(f"ACMT {blth} gagal diunduh ({e}) - stand 1 tidak ikut")
+            return None, acmt_lalu, f"ACMT {blth} gagal diunduh ({e})"
+        mentah = os.path.join(folder, f"ACMT_KodeBaca_{blth}_{stempel}.csv")
+        acmt_ini.to_csv(mentah, index=False, encoding="utf-8-sig")
+        log(f"  mentah ACMT {blth} disimpan: {mentah}")
+        return acmt_ini, acmt_lalu, None
+    except SimbaAuthError as e:
+        log(f"Sesi ACMT ditolak ({e}) - stand 1 tidak ikut")
+        # Token mati: lepas dari cache supaya operasi berikutnya login ulang,
+        # bukan memakai sesi mati yang sama lalu gagal lagi. Tidak logout
+        # (sudah tidak sah di server). Sesi yang masih hidup tetap dipakai ulang.
+        _reset_sesi_simba(logout=False)
+        return None, acmt_lalu, f"sesi ACMT ditolak ({e})"
+
+
+def _master_pelanggan(unit, log):
+    """Monitoring_Billing_Detail terbaru unit tsb (nama, alamat, kddk, gardu)."""
+    pola = os.path.join(UNDUHAN_DIR, str(unit), "*", "Monitoring_Billing_Detail_*.xlsx")
+    files = [f for f in glob.glob(pola) if not os.path.basename(f).startswith("~$")]
+    if not files:
+        log("Master pelanggan (Monitoring_Billing_Detail) tidak ada - rute dari ACMT saja")
+        return None
+    terbaru = max(files, key=os.path.getmtime)
+    perlu = {"idpel", "nama", "alamat", "tarif", "daya", "kddk", "kdgardu", "namagardu"}
+    try:
+        df = pd.read_excel(terbaru, usecols=lambda c: str(c).strip().lower() in perlu)
+    except Exception as e:
+        log(f"Master pelanggan tidak terbaca ({e})")
+        return None
+    log(f"Master pelanggan: {os.path.basename(terbaru)} ({len(df):,} baris)")
+    return pt.rapikan_master(df)
+
+
+def _buat_pagar_terkunci(blth, unit, path_gabungan, stempel, progress_callback,
+                         stop_flag, login_event, credentials_holder, kd_proses=None):
+    """Bangun Daftar Pagar Terkunci dari DLPD gabungan + ACMT + database.
+
+    Return dict ringkasan untuk messagebox "Unduh DLPD Selesai".
+    """
+
+    def log(msg):
+        if progress_callback:
+            progress_callback(("log", msg))
+
+    def percent(p):
+        if progress_callback:
+            progress_callback(("percent", p))
+
+    log(f"=== DAFTAR PAGAR TERKUNCI {blth} ===")
+    folder = os.path.dirname(path_gabungan)
+    daftar = (settings.load_unduh_settings().get("kode_akses_pagar")
+              or list(pt.KODE_AKSES_DEFAULT))
+
+    batas_baru = settings.load_rules()["pagar_stan_lalu_meter_baru"]
+    dlpd = _read_excel_auto(path_gabungan)
+
+    # Database stan baca dibaca dulu: KD BACA + STAN METER-nya adalah data
+    # ACMT yang sudah tersimpan, jadi bulan yang lengkap di sana tidak perlu
+    # diunduh ulang dari ACMT.
+    db_sb = load_stanbaca_data(stanbaca_db_path(unit), dengan_kd_baca=True)
+    bulan_di_db = set()
+    if db_sb is None:
+        log("Database stan baca unit ini belum ada - riwayat diunduh dari ACMT")
+    else:
+        hitung_bln = db_sb.groupby("BULAN").size()
+        ambang = hitung_bln.median() * verification.RASIO_BULAN_MIN
+        bulan_di_db = {str(b) for b, n in hitung_bln.items() if n >= ambang}
+        ada = [b for b in pt.bulan_sebelumnya(blth) if b in bulan_di_db]
+        log(f"Database stan baca: riwayat {len(ada)} bulan ({', '.join(sorted(ada)) or '-'})")
+    _cek_batal(stop_flag)
+
+    # ----- Unduh ACMT (sumber stand 1 DAN kode baca akses) -----
+    acmt_ini, acmt_lalu, alasan = _unduh_acmt_pagar(
+        blth, unit, folder, stempel, progress_callback, stop_flag,
+        login_event, credentials_holder, bulan_di_db,
+    )
+    percent(88)
+    # Kedua aturan bersumber dari ACMT. Tanpa ACMT bulan ini daftar TIDAK
+    # dibuat - kelainan_bc_meter billing sengaja tidak dipakai sebagai
+    # cadangan, karena isinya bisa berbeda dari kode baca ACMT untuk pelanggan
+    # yang sama (billing "KWH METER TINGGI", ACMT Z/NORMAL).
+    if acmt_ini is None:
+        log(f"Daftar pagar terkunci TIDAK dibuat: {alasan}. Login ACMT diperlukan.")
+        return {"error": f"login ACMT diperlukan - {alasan}"}
+
+    # Cakupan = pelanggan di file DLPD, yaitu Kd Proses yang dipilih (T0 =
+    # hari baca A, T1 = B, ...). Laporan ACMT selalu satu unit penuh, jadi
+    # tanpa saringan ini memilih T0 tetap merekap semua hari. Riwayat tetap
+    # dihitung dari data satu unit.
+    idpel_dlpd = set(pt.info_dlpd(dlpd)["IDPEL"])
+    n_unit = acmt_ini["IDPEL"].nunique()
+    acmt_ini = acmt_ini[acmt_ini["IDPEL"].isin(idpel_dlpd)].reset_index(drop=True)
+    hari = sorted(h for h in acmt_ini["KODE RBM"].str[6:7].unique() if h)
+    cakupan = (f"Kd Proses {', '.join(kd_proses or []) or '-'}: "
+               f"{acmt_ini['IDPEL'].nunique():,} dari {n_unit:,} pelanggan ACMT unit"
+               f" (hari baca {', '.join(hari) or '-'})")
+    log(f"Cakupan {cakupan}")
+    if acmt_ini.empty:
+        log("Daftar pagar terkunci TIDAK dibuat: tidak ada pelanggan DLPD di data ACMT")
+        return {"error": "tidak ada pelanggan file DLPD di data ACMT"}
+
+    # ----- B: kode akses = KD BACA ACMT -----
+    df_kode, hitung = pt.kode_akses_acmt(acmt_ini, daftar)
+    log("Kode baca ACMT bulan ini (cek ejaan):")
+    for kode, n in hitung.items():
+        tanda = "  <- akses" if pt.cocok_akses(pt.nama_kode_baca(kode), daftar) else ""
+        log(f"  {kode}: {n:,}{tanda}")
+    for k in daftar:
+        if not (df_kode["KODE"] == k).any():
+            log(f"  (kode akses '{k}' tidak ada bulan ini)")
+    log(f"Kode akses bulan ini: {len(df_kode):,} pelanggan")
+
+    # ----- A: stand 1 -----
+    df_s1, n_baru = pt.stand1_acmt(acmt_ini, batas_baru)
+    log(f"Stand 1 ACMT {blth}: {len(df_s1):,} pelanggan "
+        f"({n_baru:,} meter baru STAN LALU < {batas_baru:g} tidak dilaporkan)")
+    _cek_batal(stop_flag)
+
+    # ----- Riwayat -----
+    db_rek = None
+    berkas = db_path(unit)
+    if berkas:
+        log(f"Membaca database rekening {os.path.basename(berkas)}...")
+        try:
+            db_rek = _read_excel_auto(berkas)[["IDPEL", "BULAN", "STAND"]]
+        except Exception as e:
+            log(f"  database rekening tidak terbaca ({e})")
+    else:
+        log("Database rekening unit ini belum ada - riwayat tanpa database rekening")
+    _cek_batal(stop_flag)
+
+    # Riwayat kode: KD BACA dari database stan baca + unduhan ACMT bulan lalu.
+    acmt_isi = {b: d for b, d in acmt_lalu.items() if d is not None and not d.empty}
+    ada_acmt = bulan_di_db | set(acmt_isi)
+    n_acmt = len([b for b in pt.bulan_sebelumnya(blth) if b in ada_acmt])
+    tanpa = [b for b in pt.bulan_sebelumnya(blth) if b not in ada_acmt]
+    log(f"Riwayat kode baca ACMT: {n_acmt} bulan (database stan baca + unduhan)"
+        + (f"; tanpa data: {', '.join(tanpa)}" if tanpa else ""))
+    riw = pt.riwayat(blth, db_rek, db_sb, acmt_isi, daftar_acmt=daftar)
+    percent(93)
+
+    # ----- Gabung + tulis -----
+    master = _master_pelanggan(unit, log)
+    hasil = pt.gabung(df_s1, df_kode, acmt_ini, dlpd, master, riw)
+
+    rbm = acmt_ini["KODE RBM"]
+    biller = set(rbm[rbm.str.len() >= 6].str[3:6])
+    if master is not None:
+        # Hanya biller dalam cakupan Kd Proses - biller hari lain tidak perlu
+        # tampil sebagai baris nol di REKAP.
+        m = master[master["IDPEL"].isin(idpel_dlpd)]
+        biller |= set(m["KDDK"][m["KDDK"].str.len() >= 6].str[3:6])
+
+    t = pd.to_datetime(acmt_ini["TGL BACA"], format=pt.FORMAT_TGL_ACMT,
+                       errors="coerce").max()
+    tgl = t.strftime("%d/%m/%Y") if pd.notna(t) else ""
+
+    catatan = [f"Cakupan {cakupan}",
+               "Stand 1 dan kode akses dari KD BACA ACMT",
+               f"Riwayat {pt.JENDELA_RIWAYAT} bulan: kode baca ACMT {n_acmt} bulan; "
+               f"stand 1 dari database rekening/stan baca + ACMT",
+               f"{n_baru:,} meter baru (STAN LALU < {batas_baru:g}, atur di "
+               f"Pengaturan Rule) tidak dilaporkan"]
+
+    # Di hasil/<blth>/ (bersebelahan hasil_analisa), bukan di folder unduhan:
+    # ini laporan untuk dibuka operator, sedangkan unduhan berisi file mentah.
+    folder_hasil = os.path.join(HASIL_DIR, str(blth))
+    os.makedirs(folder_hasil, exist_ok=True)
+    path = os.path.join(folder_hasil, f"Pagar_Terkunci_{unit}_{blth}_{stempel}.xlsx")
+    pt.tulis_excel(hasil, path, {
+        "unit": unit, "blth": blth, "tgl_baca": tgl,
+        "catatan": catatan, "daftar_kode": daftar, "semua_biller": biller,
+    })
+
+    per_riwayat = hasil["RIWAYAT"].value_counts().to_dict()
+    ringkas = {
+        "path": path,
+        "n_total": len(hasil),
+        "n_stand1": int(hasil["_STAND1"].sum()),
+        "n_akses": int(hasil["_KODE"].ne("").sum()),
+        "n_kronis": int((hasil["KALI (TERMASUK BULAN INI)"] >= 3).sum()),
+        "per_riwayat": {k: int(per_riwayat.get(k, 0)) for k in pt.URUTAN_RIWAYAT},
+        "n_meter_baru": n_baru,
+    }
+    log(f"Daftar pagar terkunci: {ringkas['n_total']:,} pelanggan "
+        f"(stand 1 {ringkas['n_stand1']:,}, kode akses {ringkas['n_akses']:,}, "
+        f"kronis {ringkas['n_kronis']:,})")
+    log(f"  disimpan: {path}")
+    return ringkas

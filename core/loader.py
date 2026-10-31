@@ -121,9 +121,23 @@ def read_unitup(dpm_path):
     return str(unik[0])
 
 
+# Tipe kolom WAJIB numerik untuk STAND/PEMAKAIAN/DAYA: kolom object yang
+# kosong ikut terbawa merge, lalu analyzer.prepare gagal di .round() dengan
+# "Expected numeric dtype" - analisa unit yang belum punya database langsung
+# crash, padahal seharusnya semua baris jadi DATA BARU.
+DTYPE_DB = {
+    "IDPEL": "object",
+    "BULAN": "int64",
+    "STAND": "float64",
+    "PEMAKAIAN": "float64",
+    "DAYA": "float64",
+    "KEY": "object",
+}
+
+
 def db_kosong():
-    """DataFrame database kosong berkolom lengkap (dipakai saat belum diunduh)."""
-    return pd.DataFrame({k: pd.Series(dtype="object") for k in KOLOM_DB})
+    """DataFrame database kosong berkolom & bertipe lengkap (saat belum diunduh)."""
+    return pd.DataFrame({k: pd.Series(dtype=DTYPE_DB[k]) for k in KOLOM_DB})
 
 
 def load_data(dpm_path, db_path):
@@ -190,7 +204,7 @@ def load_data(dpm_path, db_path):
     return dpm, db
 
 
-def load_stanbaca_data(path):
+def load_stanbaca_data(path, dengan_kd_baca=False):
     """Load database stan baca (hasil baca meter asli per kejadian baca,
     sebelum potongan billing). Skema sumber (export "STAN BACA"): IDPEL,
     STAN METER, STAN BACA, TGL BACA, KD BACA - satu baris per kejadian baca
@@ -205,11 +219,16 @@ def load_stanbaca_data(path):
     tanggal 26), dan hasilnya dipakai untuk REKENING BULAN BERIKUTNYA -
     bukan bulan saat baca terjadi. Jadi BULAN (bulan rekening) = bulan
     TGL BACA + 1, supaya sebanding dengan BULAN di database.xlsb (yang
-    memang berisi bulan rekening).
+    memang berisi bulan rekening). Database yang diunduh aplikasi menyimpan
+    bulan rekening itu langsung di kolom BLTH, dan kolom itu diutamakan.
 
     Kalau ada lebih dari satu baca dalam bulan rekening yang sama untuk 1
     IDPEL, ambil yang paling baru (by TGL BACA) supaya konsisten dengan
     cara database.xlsb menyimpan satu STAND per IDPEL per bulan.
+
+    `dengan_kd_baca=True` ikut mengembalikan kolom KD BACA (dipakai riwayat
+    Daftar Pagar Terkunci); default-nya False supaya pemanggil lama tidak
+    berubah.
 
     Return None (bukan raise) kalau file tidak ada, atau kolom yang
     dibutuhkan tidak ditemukan, supaya pipeline bisa lanjut tanpa fitur ini
@@ -233,6 +252,9 @@ def load_stanbaca_data(path):
         out["IDPEL"] = sb["idpel"].astype(str).str.strip()
         out["STAND"] = pd.to_numeric(sb["stan meter"], errors="coerce")
         out["_TGL"] = pd.to_datetime(sb["tgl baca"], dayfirst=True, errors="coerce")
+        if dengan_kd_baca:
+            out["KD BACA"] = (sb["kd baca"].fillna("").astype(str).str.strip()
+                              if "kd baca" in sb.columns else "")
     except (ValueError, TypeError, KeyError):
         return None
 
@@ -240,11 +262,20 @@ def load_stanbaca_data(path):
     if out.empty:
         return None
 
-    # Bulan rekening = bulan baca + 1 (lihat catatan siklus baca di atas)
-    out["BULAN"] = (out["_TGL"] + pd.DateOffset(months=1)).dt.strftime("%Y%m").astype(int)
+    # Bulan rekening = kolom BLTH (blth yang diminta ke ACMT saat unduh) kalau
+    # terisi; baris lama tanpa BLTH memakai bulan baca + 1 (lihat catatan
+    # siklus baca di atas). BLTH diutamakan karena tebakan dari tanggal salah
+    # untuk baca susulan awal bulan.
+    tebakan = (out["_TGL"] + pd.DateOffset(months=1)).dt.strftime("%Y%m").astype(int)
+    if "blth" in sb.columns:
+        blth = pd.to_numeric(sb.loc[out.index, "blth"], errors="coerce")
+        out["BULAN"] = blth.fillna(tebakan).astype(int)
+    else:
+        out["BULAN"] = tebakan
 
     # Bulan rekening yang sama, IDPEL yang sama -> ambil baca paling baru
     out = out.sort_values(["IDPEL", "BULAN", "_TGL"])
     out = out.groupby(["IDPEL", "BULAN"], as_index=False).tail(1)
 
-    return out[["IDPEL", "BULAN", "STAND"]].reset_index(drop=True)
+    kolom = ["IDPEL", "BULAN", "STAND"] + (["KD BACA"] if dengan_kd_baca else [])
+    return out[kolom].reset_index(drop=True)

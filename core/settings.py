@@ -13,6 +13,7 @@ import json
 import os
 
 from config import RULE_SETTINGS_FILE, UNDUH_SETTINGS_FILE
+from core.pagar_terkunci import KODE_AKSES_DEFAULT
 
 # NOTE: setelan perbandingan pemakaian disimpan sebagai PERSEN, bukan pengali
 # (2026-08). Key-nya sengaja diganti nama saat konversi - kalau nama lama
@@ -30,6 +31,16 @@ DEFAULT_RULES = {
     "trend_persen_min": 30,         # dulu trend_growth_ratio 1.3
     "stand_tidak_wajar_toleransi": 1,
     "cabut_pasang_toleransi": 1,
+    # Tagih Ulang Pasca Nol: stand tagihan dianggap tidak didukung ACMT bila
+    # melewati stan meter ACMT lebih dari ini (stan ACMT <= 1 selalu kena).
+    "pasca_nol_toleransi_acmt": 50,
+    # Daftar Pagar Terkunci: STAN LALU di bawah ini = meter baru, stand 1-nya
+    # tidak dilaporkan (lihat core/pagar_terkunci.stand1_acmt).
+    "pagar_stan_lalu_meter_baru": 15,
+    # 1 = unduh foto SEMUA pelanggan termasuk Normal (lama & besar), 0 = hanya
+    # non-Normal + cabut/pasang bermasalah + prioritas KD BACA. Angka, bukan
+    # bool: dialog Pengaturan Rule memproses setiap isian dengan float().
+    "foto_semua_pelanggan": 0,
 }
 
 
@@ -99,6 +110,10 @@ DEFAULT_UNDUH = {
     "dlpd": "SEMUA",
     "status_verifikasi_dlpd": "BELUM",
     "kodeposting_dpm": "SUDAH",
+    # Kode kelainan_bc_meter yang masuk Daftar Pagar Terkunci (aturan B).
+    # Dicocokkan toleran (awalan / mengandung, spasi diabaikan) - lihat
+    # core/pagar_terkunci.cocok_akses. Tambah ejaan lain di file JSON.
+    "kode_akses_pagar": list(KODE_AKSES_DEFAULT),
 }
 
 

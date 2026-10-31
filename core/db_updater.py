@@ -40,7 +40,11 @@ KOLOM_REKENING = ["IDPEL", "BULAN", "STAND", "PEMAKAIAN", "DAYA", "KEY"]
 # Skema database stan baca. Nama kolomnya sengaja dipertahankan apa adanya
 # (mengandung spasi) karena loader.load_stanbaca_data mencarinya lewat nama
 # yang di-lowercase: "stan meter", "tgl baca".
-KOLOM_STAN_BACA = ["IDPEL", "STAN METER", "STAN BACA", "TGL BACA", "KD BACA"]
+# BLTH = bulan rekening yang diminta ke ACMT saat mengunduh (blth=202608
+# mengembalikan baca Juli). Itulah bulan rekening yang sebenarnya; menebaknya
+# dari TGL BACA + 1 salah untuk baca susulan awal bulan (baca 01/08 siklus
+# Juli jadi 202609). Baris lama tanpa BLTH tetap memakai tebakan itu.
+KOLOM_STAN_BACA = ["IDPEL", "STAN METER", "STAN BACA", "TGL BACA", "KD BACA", "BLTH"]
 
 # Baris header laporan Kode Baca Tunggal ada di baris ke-8 (index 7); di
 # atasnya blok judul berhias (nama wilayah, unit, periode).
@@ -163,11 +167,12 @@ def parse_billing_export(path, thblrek):
     return out[KOLOM_REKENING].reset_index(drop=True)
 
 
-def parse_kode_baca_export(xlsx_bytes, kdbaca=None):
+def parse_kode_baca_export(xlsx_bytes, kdbaca=None, blth=None):
     """Laporan Detail Kode Baca Tunggal (bytes .xlsx) -> DataFrame stan baca.
 
     Membuang blok judul di atas header serta baris ekor "TOTAL: n DATA" dan
     "Diakses oleh ..." - keduanya tidak punya IDPEL, jadi satu filter cukup.
+    `blth` = bulan rekening yang diminta, disimpan di kolom BLTH.
     """
     label = f" ({kdbaca})" if kdbaca else ""
     try:
@@ -204,6 +209,7 @@ def parse_kode_baca_export(xlsx_bytes, kdbaca=None):
     out["KD BACA"] = (
         raw[kol["kd baca"]].astype(str).str.strip() if "kd baca" in kol else ""
     )
+    out["BLTH"] = str(blth) if blth else pd.NA
 
     out = out.dropna(subset=["STAN METER"])
     out = out[out["TGL BACA"].str.lower().ne("nan") & out["TGL BACA"].ne("")]
@@ -345,6 +351,12 @@ def _bulan_rekening(seri_bulan_baca):
     return (tgl + pd.DateOffset(months=1)).dt.strftime("%Y%m")
 
 
+def _blth_teks(seri):
+    """Kolom BLTH -> 'YYYYMM' atau NA (dibaca dari Excel bisa jadi float)."""
+    angka = pd.to_numeric(seri, errors="coerce")
+    return angka.map(lambda v: str(int(v)) if pd.notna(v) else pd.NA)
+
+
 def append_stanbaca(df_baru, unitup):
     """Gabungkan baris baru ke database stan baca UNIT tsb. Return dict statistik."""
     if df_baru is None or df_baru.empty:
@@ -373,6 +385,7 @@ def append_stanbaca(df_baru, unitup):
             )
         lama["IDPEL"] = lama["IDPEL"].astype(str).str.strip()
         lama["TGL BACA"] = lama["TGL BACA"].astype(str).str.strip()
+        lama["BLTH"] = _blth_teks(lama["BLTH"])
         n_lama = len(lama)
         gabung = pd.concat([lama, df_baru], ignore_index=True)
     else:
@@ -382,14 +395,17 @@ def append_stanbaca(df_baru, unitup):
     # Satu pelanggan boleh punya banyak baris (satu per bulan baca), tapi tidak
     # boleh dua baris untuk bulan baca yang sama - itulah yang dianggap ulangan.
     # Cerminan dari groupby(["IDPEL","BULAN"]).tail(1) di loader.
-    gabung["_BLN"] = _bulan_baca(gabung["TGL BACA"])
+    # Kunci bulan = BULAN REKENING: BLTH kalau ada, selain itu tebakan dari
+    # TGL BACA + 1 (baris lama). Seluruh UI - termasuk cek coverage - juga
+    # berbicara dalam bulan rekening.
+    gabung["BLTH"] = _blth_teks(gabung["BLTH"])
+    gabung["_BLN"] = gabung["BLTH"].fillna(
+        _bulan_rekening(_bulan_baca(gabung["TGL BACA"]))
+    )
     gabung = gabung.dropna(subset=["_BLN"])
     gabung = gabung.drop_duplicates(subset=["IDPEL", "_BLN"], keep="last")
     gabung = gabung.sort_values(["_BLN", "IDPEL"])
-    # Statistik dilaporkan dalam BULAN REKENING, bukan bulan baca: baca fisik
-    # akhir bulan menagih rekening bulan berikutnya (lihat load_stanbaca_data),
-    # dan seluruh UI - termasuk cek coverage - berbicara dalam bulan rekening.
-    bulan = sorted(_bulan_rekening(gabung["_BLN"]).unique().tolist())
+    bulan = sorted(gabung["_BLN"].unique().tolist())
     gabung = gabung.drop(columns=["_BLN"]).reset_index(drop=True)
 
     backup = _backup(sumber) if sumber and os.path.exists(sumber) else None

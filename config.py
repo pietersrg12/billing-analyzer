@@ -1,5 +1,5 @@
 """
-Konfigurasi aplikasi PLN Billing Analyzer.
+Konfigurasi aplikasi SIMBA (Sistem Monitoring Baca Meter).
 
 Path resolution:
 - BUNDLE_DIR  : folder berisi resource read-only (database.xlsb, model/best.pt).
@@ -90,6 +90,8 @@ APP_DATA_DIR = _app_data_dir()
 # SIMBA API
 # =========================
 SIMBA_BASE_URL = "http://121.100.23.228:8030"
+# Legacy: token SIMBA tidak lagi disimpan (tiap sesi di-logout). Path ini
+# hanya dipakai untuk menghapus sisa file dari versi lama.
 SIMBA_TOKEN_FILE = user_path("simba_token.json")
 
 # =========================
@@ -190,6 +192,11 @@ ENABLE_DB_DOWNLOAD = True   # False = tombol "Cek Database" tidak ditampilkan
 UNDUH_SETTINGS_FILE = user_path("unduh_settings.json")
 ENABLE_UNDUH_DLPD = True
 
+# DLPD dan DPM ditarik bersamaan (2 thread) karena keduanya independen dan
+# waktunya didominasi generate di server AP2T, bukan transfer. Set False untuk
+# kembali ke berurutan kalau server ternyata mengantre export per token.
+ENABLE_UNDUH_PARALEL = True
+
 UNDUHAN_DIR = user_path("unduhan")      # arsip file mentah hasil download
 DB_BACKUP_DIR = user_path("db_backup")  # salinan database sebelum ditimpa
 
@@ -217,14 +224,22 @@ DIGIT_MODEL_PATH = resource_path("model", "digit_detector.pt")
 # IDENTITAS APLIKASI
 # =========================
 # Dikumpulkan di sini supaya teks kredit tidak tercecer di banyak tempat.
-APP_NAMA = "PLN Billing Analyzer"
-APP_VERSI = "2.1"
+# Ini nama TAMPILAN saja. Nama internal (PLN-Billing.exe, folder data
+# PLN-Billing, AppId installer) sengaja tetap supaya instalasi lama ter-upgrade
+# tanpa kehilangan token, foto, dan database.
+APP_NAMA = "SIMBA"
+APP_SUBJUDUL = "Sistem Monitoring Baca Meter"
+APP_VERSI = "2.7"
 APP_TEMPAT = "Dompu"
 APP_TAHUN = "2026"
-APP_PEMBUAT = "PMPS"
+APP_PEMBUAT = "PMPS, RIP & FDP"
 
 # =========================
 # UI
 # =========================
 THEME_DARK = "darkly"
 THEME_LIGHT = "cosmo"
+
+# Logo transparan, disiapkan sekali oleh tools/siapkan_logo.py dari logo_baru/.
+LOGO_PATH = resource_path("assets", "logo_simba.png")
+LOGO_EMBLEM_PATH = resource_path("assets", "logo_emblem.png")

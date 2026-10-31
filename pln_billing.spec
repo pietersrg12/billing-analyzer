@@ -51,7 +51,7 @@ datas = []
 binaries = []
 hiddenimports = []
 
-for pkg in ("ultralytics", "torch", "torchvision"):
+for pkg in ("ultralytics", "torch", "torchvision", "msoffcrypto"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
     datas += pkg_datas
     binaries += pkg_binaries
@@ -86,6 +86,9 @@ datas += [
     ("model/digit_detector.pt", "model"),
     ("model/display_detector.pt", "model"),
     ("assets/icon.ico", "assets"),
+    # Logo header & dialog Tentang. Kalau tertinggal, UI jatuh ke teks saja.
+    ("assets/logo_emblem.png", "assets"),
+    ("assets/logo_simba.png", "assets"),
 ]
 
 # =========================
@@ -103,6 +106,8 @@ hiddenimports += [
     "pyxlsb",
     "openpyxl",
     "openpyxl.cell._writer",
+    # dekripsi laporan ACMT terenkripsi (password = username ACMT)
+    "msoffcrypto",
     # PIL plugins yang kadang di-miss saat freeze
     "PIL._tkinter_finder",
     # ultralytics task modules (lazy import)
