@@ -7,29 +7,45 @@ pipeline tetap lanjut.
 """
 
 import threading
+import traceback
 from pathlib import Path
 
 
 _MODEL = None
 _MODEL_PATH = None
 _LOAD_FAILED = False
+_LOAD_ERROR = None
 _LOCK = threading.Lock()
 
 
+def load_error():
+    """Alasan model gagal dipakai, atau None kalau tidak ada masalah.
+
+    Kegagalan model sengaja tidak menghentikan pipeline, tapi alasannya harus
+    tetap bisa dibaca: tanpa ini semua foto jadi 'unknown' tanpa jejak apa pun.
+    """
+    return _LOAD_ERROR
+
+
 def is_available(model_path):
-    """Cek apakah model file ada dan ultralytics bisa di-import."""
+    """Cek apakah model file ada dan YOLO benar-benar bisa dipakai.
+
+    Sengaja mengimpor YOLO, bukan paket ultralytics saja: paket level atas
+    bisa terimpor sementara YOLO gagal karena dependency turunannya
+    (mis. torchvision) tidak ikut ter-bundle.
+    """
     if not Path(model_path).exists():
         return False
     try:
-        import ultralytics  # noqa: F401
+        from ultralytics import YOLO  # noqa: F401
         return True
-    except ImportError:
+    except Exception:
         return False
 
 
 def _load_model(model_path):
     """Lazy-load YOLO model. Thread-safe. Cache global."""
-    global _MODEL, _MODEL_PATH, _LOAD_FAILED
+    global _MODEL, _MODEL_PATH, _LOAD_FAILED, _LOAD_ERROR
 
     with _LOCK:
         if _MODEL is not None and _MODEL_PATH == model_path:
@@ -39,13 +55,15 @@ def _load_model(model_path):
 
         try:
             from ultralytics import YOLO
-        except ImportError:
+        except ImportError as e:
             _LOAD_FAILED = True
+            _LOAD_ERROR = f"ultralytics tidak bisa di-import: {e}"
             _MODEL_PATH = model_path
             return None
 
         if not Path(model_path).exists():
             _LOAD_FAILED = True
+            _LOAD_ERROR = f"file model tidak ada: {model_path}"
             _MODEL_PATH = model_path
             return None
 
@@ -53,21 +71,25 @@ def _load_model(model_path):
             _MODEL = YOLO(model_path)
             _MODEL_PATH = model_path
             _LOAD_FAILED = False
+            _LOAD_ERROR = None
             return _MODEL
-        except Exception:
+        except Exception as e:
             _LOAD_FAILED = True
+            _LOAD_ERROR = f"YOLO({model_path}) gagal: {type(e).__name__}: {e}\n{traceback.format_exc()}"
             _MODEL_PATH = model_path
             return None
 
 
 def classify_foto(model, foto_path):
     """Klasifikasi 1 foto. Return label string atau 'error'."""
+    global _LOAD_ERROR
     try:
         results = model.predict(str(foto_path), verbose=False)
         top1 = results[0].probs.top1
         names = results[0].names
         return names[top1]
-    except Exception:
+    except Exception as e:
+        _LOAD_ERROR = f"predict({foto_path}) gagal: {type(e).__name__}: {e}\n{traceback.format_exc()}"
         return "error"
 
 

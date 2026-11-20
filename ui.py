@@ -15,10 +15,32 @@ try:
 except ImportError:
     HAS_DND = False
 
-from core.loader import read_blth
-from core.pipeline import run_pipeline
+from core.loader import read_blth, read_unitup
+from core.pipeline import (
+    run_db_check,
+    unit_aktif,
+    run_db_update,
+    run_pipeline,
+    run_unduh_dlpd,
+    logout_sesi_simba,
+)
 from core import settings
-from config import THEME_DARK, THEME_LIGHT
+from ui_dialogs import DialogMixin, muat_logo
+from ui_koreksi import HalamanKoreksi
+from config import (
+    APP_NAMA,
+    APP_PEMBUAT,
+    APP_SUBJUDUL,
+    APP_TAHUN,
+    APP_TEMPAT,
+    APP_VERSI,
+    ENABLE_DB_DOWNLOAD,
+    ENABLE_KOREKSI,
+    ENABLE_UNDUH_DLPD,
+    LOGO_EMBLEM_PATH,
+    THEME_DARK,
+    THEME_LIGHT,
+)
 
 
 class CredentialsHolder:
@@ -28,9 +50,15 @@ class CredentialsHolder:
         self._lock = threading.Lock()
         self._creds = None
 
-    def set(self, username, password):
+    def set(self, username, password, token_info=None):
+        """`token_info` = kode enkripsi yang di-paste user; dipakai login
+        ACMT maupun portal billing."""
         with self._lock:
-            self._creds = {"username": username, "password": password}
+            self._creds = {
+                "username": username,
+                "password": password,
+                "token_info": token_info,
+            }
 
     def cancel(self):
         with self._lock:
@@ -57,56 +85,59 @@ class VerificationResultHolder:
             return bool(self._proceed)
 
 
+# Siklus billing: baca meter dilakukan di akhir bulan (median tanggal 26) dan
+# hasilnya menagih rekening bulan BERIKUTNYA. Jadi sejak tanggal 20 ke atas,
+# periode yang sedang dikerjakan orang billing sudah bulan depan - itulah yang
+# dipakai sebagai tebakan awal combobox periode.
+TANGGAL_GANTI_PERIODE = 20
+
+# Batas bawah pilihan tahun. Tetap, karena file DPM lama masih boleh dibuka;
+# batas atasnya yang ikut berjalan (lihat daftar_tahun).
+TAHUN_AWAL = 2020
+
+
+def daftar_tahun(hari_ini=None):
+    """Pilihan tahun untuk combobox: TAHUN_AWAL s.d. tahun berjalan + 1.
+
+    Dihitung, bukan didaftar tetap, supaya tidak pernah mentok - daftar yang
+    dipaku akan diam-diam kedaluwarsa dan memaksa user memilih tahun yang
+    salah. Batas atasnya +1 karena periode_default() melompat ke Januari tahun
+    berikutnya sejak 20 Desember; tanpa itu, tebakannya sendiri tidak akan ada
+    di daftar.
+    """
+    now = hari_ini or datetime.now()
+    return [str(t) for t in range(TAHUN_AWAL, now.year + 2)]
+
+
+def periode_default(hari_ini=None):
+    """Tebakan periode (tahun, bulan) berdasarkan tanggal hari ini.
+
+    Tanggal 1-19  -> bulan berjalan.
+    Tanggal 20-31 -> bulan berikutnya (ikut pergantian tahun di Desember).
+
+    Cuma nilai awal combobox; user tetap bisa menggantinya, dan memilih file
+    DPM akan menimpanya dengan thblrek dari file itu (lihat _autofill_blth).
+    """
+    now = hari_ini or datetime.now()
+    tahun, bulan = now.year, now.month
+    if now.day >= TANGGAL_GANTI_PERIODE:
+        bulan += 1
+        if bulan > 12:
+            bulan = 1
+            tahun += 1
+    return str(tahun), f"{bulan:02d}"
+
+
 STEPS = ["Load", "Prepare", "Analyze", "Download", "Export"]
 
 STEP_THRESHOLDS = [0, 10, 20, 22, 85]
 
-# Pengelompokan field untuk dialog Pengaturan Rule: (judul grup, [(key, label), ...])
-RULE_FIELD_GROUPS = [
-    ("Riwayat / Rata-rata", [
-        ("jumlah_bulan_rata2", "Jumlah bulan riwayat (rata-rata, sparkline, trend)"),
-    ]),
-    ("Jam Nyala", [
-        ("jam_nyala_tinggi_min", "Batas bawah Jam Tinggi (jam)"),
-        ("jam_nyala_tidak_wajar_min", "Batas Jam Tidak Wajar (jam)"),
-        ("stand_p1_jam_konstan", "Konstanta jam proyeksi STAND_P1"),
-    ]),
-    ("Kenaikan", [
-        ("kenaikan_pemakaian_min", "Pemakaian minimum (kWh)"),
-        ("kenaikan_multiplier", "Pengali RATA2"),
-        ("kenaikan_tambahan", "Tambahan tetap ke RATA2 (kWh)"),
-    ]),
-    ("Perlu Perhatian", [
-        ("perlu_perhatian_ratio_min", "Rasio minimum (x RATA2)"),
-        ("perlu_perhatian_ratio_max", "Rasio maksimum (x RATA2)"),
-        ("perlu_perhatian_pemakaian_min", "Pemakaian minimum (kWh)"),
-    ]),
-    ("Penurunan", [
-        ("penurunan_ratio_max", "Rasio maksimum (x RATA2)"),
-    ]),
-    ("Anomali Daya", [
-        ("anomali_daya_multiplier", "Pengali DAYA"),
-    ]),
-    ("Trend Naik", [
-        ("trend_min_bulan", "Minimum bulan konsisten naik"),
-        ("trend_growth_ratio", "Rasio pertumbuhan minimum"),
-    ]),
-    ("Stand Tidak Wajar", [
-        ("stand_tidak_wajar_toleransi", "Toleransi selisih stand vs pemakaian (kWh)"),
-    ]),
-    ("Indikasi Stan Baca (Meter Macet / Rumah Kosong / Cap Jam Nyala)", [
-        ("stan_baca_flat_toleransi", "Toleransi stand baca dianggap 'tidak berubah' (kWh)"),
-        ("stan_baca_flat_min_bulan", "Jumlah bulan berturut-turut untuk pola flat"),
-        ("stan_baca_placeholder_max", "Nilai stand dianggap placeholder / tidak dibaca (<=)"),
-    ]),
-]
 
-
-class App:
+class App(DialogMixin):
 
     def __init__(self, root):
         self.root = root
-        self.root.title("PLN Billing Analyzer")
+        self.root.title(f"{APP_NAMA} - {APP_SUBJUDUL}")
         self.root.minsize(720, 680)
         self.root.resizable(True, True)
 
@@ -119,14 +150,75 @@ class App:
         self.credentials_holder = CredentialsHolder()
         self.verify_event = threading.Event()
         self.verify_holder = VerificationResultHolder()
+        # Portal billing punya jalur login sendiri: host, token, dan skema
+        # kredensialnya beda dari ACMT, jadi tidak bisa berbagi event.
+        self.billing_login_event = threading.Event()
+        self.billing_credentials_holder = CredentialsHolder()
 
         self._build_header()
+        self._build_tab_utama()
         self._build_input_section()
         self._build_progress_section()
         self._build_action_buttons()
         self._build_log_section()
+        if self.tab_utama is not None:
+            self.halaman_koreksi = HalamanKoreksi(self.tab_utama, self)
+            self.tab_utama.add(self.halaman_koreksi, text="   Koreksi   ")
+
+        self._perbarui_label_unit()
+
+        # Tutup window WAJIB lewat _on_close supaya sesi ACMT selalu di-logout.
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.root.after(100, self._process_queue)
+
+    def _on_close(self):
+        """Logout sesi ACMT (wajib) lalu tutup aplikasi.
+
+        Logout best-effort: dijalankan di thread dengan batas tunggu pendek
+        supaya kegagalan/lambatnya server tidak membuat window menggantung.
+        """
+        koreksi = getattr(self, "halaman_koreksi", None)
+        if koreksi is not None and koreksi.tugas == "kirim":
+            # Menutup di tengah POST membuat status baris itu tidak pasti.
+            if not messagebox.askyesno(
+                "Koreksi sedang dikirim",
+                "Pengiriman koreksi masih berjalan. Tutup aplikasi sekarang?",
+            ):
+                return
+        if self.running:
+            # Operasi masih jalan: minta berhenti dulu supaya tidak ada request
+            # ACMT yang menabrak logout.
+            self.stop = True
+        try:
+            t = threading.Thread(
+                target=lambda: logout_sesi_simba(self.queue.put), daemon=True)
+            t.start()
+            t.join(timeout=8)
+        except Exception:
+            pass
+        self.root.destroy()
+
+    # ── TAB UTAMA ─────────────────────────────────────────
+
+    def _build_tab_utama(self):
+        """Tab Analisa | Koreksi. Tanpa ENABLE_KOREKSI, halaman Analisa langsung
+        di root seperti sebelumnya."""
+        self.halaman_koreksi = None
+        if not ENABLE_KOREKSI:
+            self.tab_utama = None
+            self.halaman_analisa = self.root
+            return
+        self.tab_utama = tb.Notebook(self.root)
+        self.tab_utama.pack(fill=BOTH, expand=True)
+        self.halaman_analisa = tb.Frame(self.tab_utama)
+        self.tab_utama.add(self.halaman_analisa, text="   Analisa   ")
+
+    def _tab_koreksi_aktif(self):
+        return (
+            self.tab_utama is not None
+            and self.tab_utama.select() == str(self.halaman_koreksi)
+        )
 
     # ── HEADER ────────────────────────────────────────────
 
@@ -137,13 +229,23 @@ class App:
         inner = tb.Frame(header)
         inner.pack(fill=X, padx=15, pady=10)
 
-        title = tb.Label(
-            inner,
-            text="⚡ PLN Billing Analyzer",
-            font=("Segoe UI", 18, "bold"),
-            bootstyle=(INVERSE, PRIMARY),
-        )
-        title.pack(side=LEFT)
+        judul = tb.Frame(inner)
+        judul.pack(side=LEFT)
+
+        # Disimpan di atribut: tanpa referensi, PhotoImage dimakan garbage
+        # collector dan labelnya kosong.
+        self._logo_header = muat_logo(LOGO_EMBLEM_PATH, 48)
+        if self._logo_header:
+            tb.Label(judul, image=self._logo_header).pack(side=LEFT, padx=(0, 10))
+
+        teks = tb.Frame(judul)
+        teks.pack(side=LEFT)
+        tb.Label(
+            teks, text=APP_NAMA, font=("Segoe UI", 18, "bold"),
+        ).pack(anchor=W)
+        tb.Label(
+            teks, text=APP_SUBJUDUL, font=("Segoe UI", 9), bootstyle=INFO,
+        ).pack(anchor=W)
 
         btn_frame = tb.Frame(inner)
         btn_frame.pack(side=RIGHT)
@@ -166,6 +268,58 @@ class App:
         )
         self.rule_settings_btn.pack(side=RIGHT, padx=(5, 0))
 
+        self.about_btn = tb.Button(
+            btn_frame,
+            text="ℹ",
+            bootstyle=(SECONDARY, OUTLINE),
+            command=self._show_about_dialog,
+            width=3,
+        )
+        self.about_btn.pack(side=RIGHT, padx=(5, 0))
+
+        # Unit ditampilkan permanen: salah unit berarti aplikasi memakai
+        # database milik orang lain, dan itu harus ketahuan SEBELUM menekan
+        # apa pun - bukan setelah analisis selesai.
+        self.unit_btn = tb.Button(
+            btn_frame,
+            text="Unit: -",
+            bootstyle=(SECONDARY, OUTLINE),
+            command=self._ganti_unit,
+        )
+        self.unit_btn.pack(side=RIGHT, padx=(5, 0))
+
+        if ENABLE_DB_DOWNLOAD:
+            self.db_check_btn = tb.Button(
+                btn_frame,
+                text="🗄 Cek Database",
+                bootstyle=(SUCCESS, OUTLINE),
+                command=self._check_database,
+                width=16,
+            )
+            self.db_check_btn.pack(side=RIGHT, padx=(5, 0))
+        else:
+            self.db_check_btn = None
+
+    def _perbarui_label_unit(self, unit=None):
+        """Segarkan tulisan tombol unit di header."""
+        if getattr(self, "unit_btn", None) is None:
+            return
+        unit = unit or unit_aktif()
+        if unit:
+            self.unit_btn.config(text=f"Unit: {unit}", bootstyle=(INFO, OUTLINE))
+        else:
+            # Tanpa width tetap, tombol menyesuaikan isinya. Dengan width dipaku,
+            # "Unit: belum dipilih" terpotong jadi "Unit: belum dipi" - persis di
+            # keadaan yang paling perlu terbaca, yaitu instalasi yang belum login.
+            self.unit_btn.config(
+                text="Unit: belum dipilih", bootstyle=(WARNING, OUTLINE)
+            )
+
+    def _ganti_unit(self):
+        if self.running:
+            return
+        self._show_unit_dialog()
+
     def _toggle_theme(self):
         style = tb.Style()
         if self.is_dark:
@@ -179,7 +333,7 @@ class App:
     # ── INPUT SECTION ─────────────────────────────────────
 
     def _build_input_section(self):
-        frame = tb.LabelFrame(self.root, text="  Input Data  ")
+        frame = tb.LabelFrame(self.halaman_analisa, text="  Input Data  ")
         frame.pack(fill=X, padx=15, pady=(15, 5), ipadx=10, ipady=8)
 
         # Row 1: File path
@@ -205,11 +359,23 @@ class App:
         )
         self.browse_btn.pack(side=RIGHT)
 
+        if ENABLE_UNDUH_DLPD:
+            self.unduh_dlpd_btn = tb.Button(
+                file_frame,
+                text="⬇  Unduh DLPD",
+                command=self._unduh_dlpd,
+                bootstyle=INFO,
+                width=15,
+            )
+            self.unduh_dlpd_btn.pack(side=RIGHT, padx=(0, 8))
+        else:
+            self.unduh_dlpd_btn = None
+
         # Drag & drop hint
         if HAS_DND:
             self.drop_label = tb.Label(
                 frame,
-                text="💡 Drop file DPM ke area ini",
+                text="💡 Unduh atau drop file DPM ke area ini",
                 font=("Segoe UI", 9, "italic"),
                 bootstyle=SECONDARY,
             )
@@ -225,17 +391,18 @@ class App:
             side=LEFT, padx=(0, 8)
         )
 
+        sekarang = datetime.now()
+
         self.year_var = tk.StringVar()
         self.year_cb = tb.Combobox(
             period_frame,
             textvariable=self.year_var,
-            values=[str(i) for i in range(2020, 2031)],
+            values=daftar_tahun(sekarang),
             width=8,
             state="readonly",
             bootstyle=INFO,
         )
         self.year_cb.pack(side=LEFT, padx=(0, 4))
-        self.year_cb.set("2025")
 
         tb.Label(period_frame, text="-", font=("Segoe UI", 10)).pack(
             side=LEFT, padx=(0, 4)
@@ -251,10 +418,49 @@ class App:
             bootstyle=INFO,
         )
         self.month_cb.pack(side=LEFT)
-        self.month_cb.set("01")
+
+        # `sekarang` yang sama dipakai daftar_tahun() di atas, jadi tebakannya
+        # dijamin ada di daftar - tidak perlu jalur cadangan.
+        tahun_awal, bulan_awal = periode_default(sekarang)
+        self.year_cb.set(tahun_awal)
+        self.month_cb.set(bulan_awal)
+
+    def _periksa_unit_file(self, path):
+        """Samakan unit aktif dengan unit file DLPD yang baru dipilih.
+
+        File itu sendiri yang menentukan database mana yang dipakai saat
+        analisis, jadi unit aktif harus ikut - kalau tidak, tombol Cek Database
+        akan melaporkan unit yang berbeda dari yang sedang dikerjakan.
+        """
+        try:
+            unit_file = read_unitup(path)
+        except Exception:
+            unit_file = None
+        if not unit_file:
+            # File tanpa kolom unitup, atau memuat lebih dari satu unit (mis.
+            # export level UP3). Jangan menebak - biarkan unit aktif apa adanya.
+            self._add_log("File tidak menyatakan satu unit; unit aktif dibiarkan", "info")
+            return
+
+        lama = unit_aktif()
+        if lama == unit_file:
+            return
+
+        settings.set_unit_aktif(unit_file)
+        self._perbarui_label_unit(unit_file)
+        self._add_log(f"Unit aktif mengikuti file: {lama or '-'} -> {unit_file}", "info")
+        messagebox.showinfo(
+            "Unit berbeda",
+            f"File DLPD ini milik unit {unit_file}, sedangkan unit aktif "
+            f"sebelumnya {lama or 'belum dipilih'}.\n\n"
+            f"Unit aktif sudah diubah ke {unit_file}. Login sebagai unit "
+            f"{unit_file} lalu perbarui databasenya lewat Cek Database, supaya "
+            f"analisisnya memakai riwayat yang benar.",
+        )
 
     def _autofill_blth(self, path):
-        """Baca thblrek dari file DPM, auto-fill combobox tahun & bulan."""
+        """Baca thblrek + unitup dari file DPM, sesuaikan periode & unit."""
+        self._periksa_unit_file(path)
         try:
             blth = read_blth(path)
         except Exception:
@@ -281,13 +487,16 @@ class App:
     def _on_drop(self, event):
         path = event.data.strip("{}")
         if os.path.isfile(path):
+            if self._tab_koreksi_aktif():
+                self.halaman_koreksi.pilih_file(path)
+                return
             self.path_var.set(path)
             self._autofill_blth(path)
 
     # ── PROGRESS SECTION ──────────────────────────────────
 
     def _build_progress_section(self):
-        frame = tb.LabelFrame(self.root, text="  Progress  ")
+        frame = tb.LabelFrame(self.halaman_analisa, text="  Progress  ")
         frame.pack(fill=X, padx=15, pady=5, ipadx=10, ipady=8)
 
         # Step indicators
@@ -400,7 +609,7 @@ class App:
     # ── ACTION BUTTONS ────────────────────────────────────
 
     def _build_action_buttons(self):
-        frame = tb.Frame(self.root)
+        frame = tb.Frame(self.halaman_analisa)
         frame.pack(fill=X, padx=15, pady=10)
 
         self.run_btn = tb.Button(
@@ -433,11 +642,19 @@ class App:
         self.year_cb.config(state="disabled" if running else "readonly")
         self.month_cb.config(state="disabled" if running else "readonly")
         self.path_entry.config(state="disabled" if running else NORMAL)
+        if getattr(self, "db_check_btn", None) is not None:
+            self.db_check_btn.config(state=state_run)
+        if getattr(self, "unduh_dlpd_btn", None) is not None:
+            self.unduh_dlpd_btn.config(state=state_run)
+        if getattr(self, "unit_btn", None) is not None:
+            self.unit_btn.config(state=state_run)
+        if getattr(self, "halaman_koreksi", None) is not None:
+            self.halaman_koreksi.perbarui()
 
     # ── LOG SECTION ───────────────────────────────────────
 
     def _build_log_section(self):
-        frame = tb.LabelFrame(self.root, text="  Log Aktivitas  ")
+        frame = tb.LabelFrame(self.halaman_analisa, text="  Log Aktivitas  ")
         frame.pack(fill=BOTH, expand=True, padx=15, pady=(5, 15), ipadx=8, ipady=8)
 
         self.log_text = ScrolledText(
@@ -543,368 +760,232 @@ class App:
 
         self.queue.put(("done", None))
 
-    # ── RULE SETTINGS DIALOG ──────────────────────────────
 
-    def _show_rule_settings_dialog(self):
-        """Dialog untuk mengubah threshold rule anomali. Simpan/Reset/Batal."""
+    # ── CEK & UPDATE DATABASE ─────────────────────────────
 
-        current = settings.load_rules()
+    def _check_database(self):
+        """Cek kelengkapan database untuk periode yang dipilih."""
+        if self.running:
+            return
 
-        dialog = tb.Toplevel(self.root)
-        dialog.title("Pengaturan Rule Deteksi Anomali")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        dialog.geometry("480x560")
+        year = self.year_var.get()
+        month = self.month_var.get()
+        if not year or not month:
+            messagebox.showwarning(
+                "Peringatan", "Pilih tahun dan bulan dulu sebelum cek database."
+            )
+            return
 
-        tb.Label(
-            dialog,
-            text="Pengaturan Rule Deteksi Anomali",
-            font=("Segoe UI", 13, "bold"),
-            bootstyle=PRIMARY,
-        ).pack(anchor=W, padx=15, pady=(15, 10))
-
-        body = tb.Frame(dialog, padding=(15, 0, 5, 0))
-        body.pack(fill=BOTH, expand=True)
-
-        canvas = tk.Canvas(body, highlightthickness=0)
-        scrollbar = tb.Scrollbar(body, orient=VERTICAL, command=canvas.yview)
-        scroll_frame = tb.Frame(canvas)
-
-        scroll_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
-        )
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side=LEFT, fill=BOTH, expand=True)
-        scrollbar.pack(side=RIGHT, fill=Y)
-
-        def _on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        canvas.bind_all("<MouseWheel>", _on_mousewheel)
-
-        field_vars = {}
-        row = 0
-        for group_title, fields in RULE_FIELD_GROUPS:
-            tb.Label(
-                scroll_frame,
-                text=group_title,
-                font=("Segoe UI", 10, "bold"),
-                bootstyle=INFO,
-            ).grid(row=row, column=0, columnspan=2, sticky=W, pady=(10, 2), padx=(0, 10))
-            row += 1
-            for key, label in fields:
-                tb.Label(scroll_frame, text=label, font=("Segoe UI", 9)).grid(
-                    row=row, column=0, sticky=W, padx=(10, 8), pady=2
-                )
-                var = tk.StringVar(value=str(current.get(key, settings.DEFAULT_RULES[key])))
-                entry = tb.Entry(scroll_frame, textvariable=var, width=10, font=("Segoe UI", 9))
-                entry.grid(row=row, column=1, sticky=W, pady=2, padx=(0, 15))
-                field_vars[key] = var
-                row += 1
-
-        btn_frame = tb.Frame(dialog, padding=(15, 10, 15, 15))
-        btn_frame.pack(fill=X)
-
-        def _reset():
-            for key, var in field_vars.items():
-                var.set(str(settings.DEFAULT_RULES[key]))
-
-        def _save():
-            new_rules = {}
-            try:
-                for key, var in field_vars.items():
-                    raw = var.get().strip()
-                    if isinstance(settings.DEFAULT_RULES[key], int):
-                        new_rules[key] = int(float(raw))
-                    else:
-                        new_rules[key] = float(raw)
-            except ValueError:
-                messagebox.showerror(
-                    "Input tidak valid",
-                    "Semua nilai harus berupa angka.",
-                    parent=dialog,
-                )
-                return
-            settings.save_rules(new_rules)
-            messagebox.showinfo("Tersimpan", "Pengaturan rule disimpan.", parent=dialog)
-            canvas.unbind_all("<MouseWheel>")
-            dialog.destroy()
-
-        def _cancel():
-            canvas.unbind_all("<MouseWheel>")
-            dialog.destroy()
-
-        tb.Button(
-            btn_frame, text="Reset ke Default", command=_reset, bootstyle=WARNING, width=16
-        ).pack(side=LEFT)
-        tb.Button(
-            btn_frame, text="Batal", command=_cancel, bootstyle=SECONDARY, width=10
-        ).pack(side=RIGHT, padx=(8, 0))
-        tb.Button(
-            btn_frame, text="Simpan", command=_save, bootstyle=SUCCESS, width=10
-        ).pack(side=RIGHT)
-
-        dialog.protocol("WM_DELETE_WINDOW", _cancel)
-
-        dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
-        dialog.geometry(f"+{x}+{y}")
-
-        dialog.wait_window()
-
-    # ── VERIFIKASI DATABASE DIALOG ────────────────────────
-
-    def _show_verification_dialog(self, payload):
-        """Dialog ringkasan coverage database. Blocking sampai user Lanjut/Batal."""
-
-        n_bulan = payload.get("n_bulan", 6)
-
-        dialog = tb.Toplevel(self.root)
-        dialog.title("Verifikasi Database")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        dialog.resizable(False, False)
-
-        frm = tb.Frame(dialog, padding=20)
-        frm.pack(fill=BOTH, expand=True)
-
-        tb.Label(
-            frm,
-            text="Verifikasi Coverage Database",
-            font=("Segoe UI", 13, "bold"),
-            bootstyle=PRIMARY,
-        ).pack(anchor=W, pady=(0, 4))
-
-        tb.Label(
-            frm,
-            text=f"Mengecek apakah database sudah terisi {n_bulan} bulan terakhir "
-                 f"(sesuai Pengaturan Rule).",
-            font=("Segoe UI", 9),
-            bootstyle=SECONDARY,
-            wraplength=420,
-        ).pack(anchor=W, pady=(0, 12))
-
-        def _render_db_summary(title, cov):
-            box = tb.LabelFrame(frm, text=f"  {title}  ")
-            box.pack(fill=X, pady=(0, 10))
-            inner = tb.Frame(box, padding=8)
-            inner.pack(fill=X)
-
-            if cov is None:
-                tb.Label(inner, text="Fitur ini tidak diaktifkan.", bootstyle=SECONDARY).pack(
-                    anchor=W
-                )
+        # Unit harus jelas SEBELUM mengecek: tanpa itu laporannya bisa tentang
+        # database unit lain, dan salahnya baru ketahuan saat analisis.
+        unit = unit_aktif()
+        if not unit:
+            unit = self._show_unit_dialog()
+            if not unit:
+                self._add_log("Cek database dibatalkan - unit belum dipilih", "error")
                 return
 
-            if not cov.get("available"):
-                tb.Label(
-                    inner,
-                    text="Database tidak ditemukan / kosong.",
-                    bootstyle=DANGER,
-                ).pack(anchor=W)
-                return
+        blth = year + month
+        self._set_running(True)
+        self.status_label.config(text="Mengecek database...", bootstyle=INFO)
+        self._add_log(f"Cek kelengkapan database untuk periode {blth} (unit {unit})", "info")
 
-            missing = cov.get("missing_bulan") or []
-            if missing:
-                tb.Label(
-                    inner,
-                    text=f"⚠ Bulan belum ada datanya (db-wide): {', '.join(missing)}",
-                    font=("Segoe UI", 9, "bold"),
-                    bootstyle=DANGER,
-                    wraplength=400,
-                ).pack(anchor=W)
-            else:
-                tb.Label(
-                    inner,
-                    text="Semua bulan yang diharapkan sudah ada datanya.",
-                    bootstyle=SUCCESS,
-                ).pack(anchor=W)
-
-            n_checked = cov.get("n_idpel_checked", 0)
-            n_incomplete = cov.get("n_idpel_incomplete", 0)
-            n_efektif = cov.get("n_bulan_efektif", n_bulan)
-            style = SUCCESS if n_incomplete == 0 else WARNING
-            tb.Label(
-                inner,
-                text=f"{n_incomplete} dari {n_checked} pelanggan riwayatnya belum "
-                     f"lengkap {n_efektif} bulan yang tersedia di database.",
-                bootstyle=style,
-            ).pack(anchor=W, pady=(4, 0))
-
-            sample = cov.get("sample_incomplete") or []
-            if sample:
-                sample_txt = ", ".join(f"{idpel} ({n}bln)" for idpel, n in sample[:10])
-                tb.Label(
-                    inner,
-                    text=f"Contoh: {sample_txt}",
-                    font=("Segoe UI", 8, "italic"),
-                    bootstyle=SECONDARY,
-                    wraplength=400,
-                ).pack(anchor=W, pady=(2, 0))
-
-        _render_db_summary("Database Rekening", payload.get("rekening"))
-        _render_db_summary("Database Stan Baca", payload.get("stanbaca"))
-
-        has_missing = any(
-            (cov or {}).get("missing_bulan")
-            for cov in (payload.get("rekening"), payload.get("stanbaca"))
+        t = threading.Thread(
+            target=self._check_db_thread, args=(blth, unit), daemon=True
         )
+        t.start()
 
-        ack_var = tb.BooleanVar(value=False)
-        if has_missing:
-            tb.Checkbutton(
-                frm,
-                text="Saya paham database belum lengkap dan tetap ingin melanjutkan"
-                     " (hasil analisis bisa keliru untuk bulan yang hilang).",
-                variable=ack_var,
-                bootstyle="danger",
-                command=lambda: proceed_btn.config(
-                    state=NORMAL if ack_var.get() else DISABLED
-                ),
-            ).pack(anchor=W, pady=(4, 0), fill=X)
+    def _check_db_thread(self, blth, unitup):
+        # Membaca database ratusan ribu baris makan beberapa detik - jangan
+        # sampai membekukan Tk. Hasilnya dikembalikan lewat queue seperti
+        # semua pesan pipeline lain.
+        try:
+            hasil = run_db_check(blth, unitup=unitup,
+                                 progress_callback=self.queue.put)
+            self.queue.put(("db_check_result", hasil))
+        except Exception as e:
+            self.queue.put(("log", f"ERROR cek database: {e}"))
+            self.queue.put(("db_check_result", None))
 
-        btn_frame = tb.Frame(frm)
-        btn_frame.pack(fill=X, pady=(8, 0))
 
-        def _proceed():
-            self.verify_holder.set(True)
-            dialog.destroy()
+    def _start_db_update(self, bulan_rekening, bulan_stanbaca):
+        self.stop = False
+        self.billing_login_event.clear()
+        self.billing_credentials_holder.cancel()
+        self.login_event.clear()
+        self.credentials_holder.cancel()
+        self._error_occurred = False
+        self._set_running(True)
+        self.progress_bar["value"] = 0
+        self.percent_label.config(text="0%")
+        self.status_label.config(text="Update database...", bootstyle=INFO)
+        self.eta_label.config(text="")
 
-        def _cancel():
-            self.verify_holder.set(False)
-            self.stop = True
-            dialog.destroy()
-
-        proceed_btn = tb.Button(
-            btn_frame, text="Lanjut", command=_proceed, bootstyle=SUCCESS, width=12
+        t = threading.Thread(
+            target=self._db_update_thread,
+            args=(bulan_rekening, bulan_stanbaca),
+            daemon=True,
         )
-        proceed_btn.pack(side=RIGHT, padx=(8, 0))
-        if has_missing:
-            proceed_btn.config(state=DISABLED)
-        tb.Button(
-            btn_frame, text="Batal", command=_cancel, bootstyle=SECONDARY, width=12
-        ).pack(side=RIGHT)
+        t.start()
 
-        dialog.protocol("WM_DELETE_WINDOW", _cancel)
+    def _db_update_thread(self, bulan_rekening, bulan_stanbaca):
+        # Sengaja TIDAK memakai pesan "done": handler-nya memunculkan
+        # "Proses analisa selesai!" yang keliru untuk pekerjaan unduh.
+        try:
+            hasil = run_db_update(
+                bulan_rekening,
+                bulan_stanbaca,
+                unit_diharapkan=unit_aktif(),
+                progress_callback=self.queue.put,
+                stop_flag=lambda: self.stop,
+                login_event=self.login_event,
+                credentials_holder=self.credentials_holder,
+                billing_login_event=self.billing_login_event,
+                billing_credentials_holder=self.billing_credentials_holder,
+            )
+            self.queue.put(("db_update_done", hasil))
+        except Exception as e:
+            self.queue.put(("log", f"ERROR update database: {e}"))
+            self.queue.put(("db_update_done", None))
 
-        dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
-        dialog.geometry(f"+{x}+{y}")
+    def _finish_db_update(self, hasil):
+        self._set_running(False)
+        # Login di dalam proses update bisa menetapkan unit; segarkan labelnya.
+        self._perbarui_label_unit()
+        self.eta_label.config(text="")
 
-        dialog.wait_window()
+        if hasil is None:
+            self.status_label.config(text="Update database gagal", bootstyle=DANGER)
+            self.progress_bar["value"] = 0
+            self.percent_label.config(text="0%")
+            return
 
-        self.verify_event.set()
-
-    # ── SIMBA LOGIN DIALOG ────────────────────────────────
-
-    def _show_simba_login_dialog(self):
-        """Modal dialog untuk input kredensial SIMBA. Blocking sampai user submit/cancel."""
-
-        dialog = tb.Toplevel(self.root)
-        dialog.title("Login SIMBA")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        dialog.resizable(False, False)
-
-        frm = tb.Frame(dialog, padding=20)
-        frm.pack(fill=BOTH, expand=True)
-
-        tb.Label(
-            frm,
-            text="Login SIMBA",
-            font=("Segoe UI", 14, "bold"),
-            bootstyle=PRIMARY,
-        ).grid(row=0, column=0, columnspan=2, sticky=W, pady=(0, 4))
-
-        tb.Label(
-            frm,
-            text="Masukkan kredensial SIMBA Anda untuk mengambil data foto meter.",
-            font=("Segoe UI", 9),
-            bootstyle=SECONDARY,
-            wraplength=320,
-        ).grid(row=1, column=0, columnspan=2, sticky=W, pady=(0, 12))
-
-        tb.Label(frm, text="Username:", font=("Segoe UI", 10)).grid(
-            row=2, column=0, sticky=W, pady=4
-        )
-        username_var = tk.StringVar()
-        user_entry = tb.Entry(
-            frm, textvariable=username_var, font=("Segoe UI", 10), width=28
-        )
-        user_entry.grid(row=2, column=1, sticky=EW, pady=4, padx=(8, 0))
-
-        tb.Label(frm, text="Password:", font=("Segoe UI", 10)).grid(
-            row=3, column=0, sticky=W, pady=4
-        )
-        password_var = tk.StringVar()
-        pass_entry = tb.Entry(
-            frm,
-            textvariable=password_var,
-            font=("Segoe UI", 10),
-            width=28,
-            show="•",
-        )
-        pass_entry.grid(row=3, column=1, sticky=EW, pady=4, padx=(8, 0))
-
-        hint = tb.Label(
-            frm,
-            text="Format: 12345.namauser (5 digit unitup + nama)",
-            font=("Segoe UI", 8, "italic"),
-            bootstyle=SECONDARY,
-        )
-        hint.grid(row=4, column=0, columnspan=2, sticky=W, pady=(2, 12))
-
-        btn_frame = tb.Frame(frm)
-        btn_frame.grid(row=5, column=0, columnspan=2, sticky=EW)
-
-        result = {"submitted": False}
-
-        def submit():
-            u = username_var.get().strip()
-            p = password_var.get()
-            if not u or not p:
-                messagebox.showwarning(
-                    "Peringatan",
-                    "Username dan password tidak boleh kosong.",
-                    parent=dialog,
+        baris = []
+        for judul, kunci in (("Rekening", "rekening"), ("Stan baca", "stanbaca")):
+            stat = hasil.get(kunci)
+            if stat:
+                baris.append(
+                    f"{judul}: {stat['n_total']:,} baris "
+                    f"(+{stat['n_baru']:,} baru)\n{stat['path']}"
                 )
-                return
-            self.credentials_holder.set(u, p)
-            result["submitted"] = True
-            dialog.destroy()
 
-        def cancel():
-            self.credentials_holder.cancel()
-            self.stop = True
-            dialog.destroy()
+        if not baris:
+            self.status_label.config(text="Update dibatalkan", bootstyle=WARNING)
+            return
 
-        tb.Button(
-            btn_frame, text="Login", command=submit, bootstyle=SUCCESS, width=12
-        ).pack(side=RIGHT, padx=(8, 0))
-        tb.Button(
-            btn_frame, text="Cancel", command=cancel, bootstyle=SECONDARY, width=12
-        ).pack(side=RIGHT)
+        self.progress_bar["value"] = 100
+        self.percent_label.config(text="100%")
+        self.status_label.config(text="Database diperbarui ✓", bootstyle=SUCCESS)
+        messagebox.showinfo("Update Database Selesai", "\n\n".join(baris))
 
-        dialog.bind("<Return>", lambda e: submit())
-        dialog.bind("<Escape>", lambda e: cancel())
-        dialog.protocol("WM_DELETE_WINDOW", cancel)
 
-        # Center dialog on root
-        dialog.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
-        dialog.geometry(f"+{x}+{y}")
+    # ── UNDUH FILE DLPD ───────────────────────────────────
 
-        user_entry.focus_set()
-        dialog.wait_window()
+    def _unduh_dlpd(self):
+        """Buka dialog pilihan Kd Proses lalu unduh file input DLPD."""
+        if self.running:
+            return
 
-        # Lepas pipeline thread
-        self.login_event.set()
+        year = self.year_var.get()
+        month = self.month_var.get()
+        if not year or not month:
+            messagebox.showwarning(
+                "Peringatan", "Pilih tahun dan bulan dulu sebelum unduh DLPD."
+            )
+            return
+
+        kd_proses = self._show_kd_proses_dialog()
+        if not kd_proses:
+            return
+
+        blth = year + month
+        self.stop = False
+        self.billing_login_event.clear()
+        self.billing_credentials_holder.cancel()
+        self.login_event.clear()
+        self.credentials_holder.cancel()
+        self._login_acmt_opsional = True
+        self._error_occurred = False
+        self._set_running(True)
+        self.progress_bar["value"] = 0
+        self.percent_label.config(text="0%")
+        self.status_label.config(text="Unduh file DLPD...", bootstyle=INFO)
+        self.eta_label.config(text="")
+
+        t = threading.Thread(
+            target=self._unduh_dlpd_thread, args=(blth, kd_proses), daemon=True
+        )
+        t.start()
+
+    def _unduh_dlpd_thread(self, blth, kd_proses):
+        # Pesan sendiri, bukan "done": handler "done" memunculkan
+        # "Proses analisa selesai!" yang keliru untuk pekerjaan unduh.
+        try:
+            stat = run_unduh_dlpd(
+                blth,
+                kd_proses,
+                progress_callback=self.queue.put,
+                stop_flag=lambda: self.stop,
+                billing_login_event=self.billing_login_event,
+                billing_credentials_holder=self.billing_credentials_holder,
+                login_event=self.login_event,
+                credentials_holder=self.credentials_holder,
+            )
+            self.queue.put(("unduh_dlpd_done", stat))
+        except Exception as e:
+            self.queue.put(("log", f"ERROR unduh DLPD: {e}"))
+            self.queue.put(("unduh_dlpd_done", None))
+
+    def _finish_unduh_dlpd(self, stat):
+        self._set_running(False)
+        self._login_acmt_opsional = False
+        self.eta_label.config(text="")
+
+        if stat is None:
+            self.status_label.config(text="Unduh DLPD gagal/dibatalkan", bootstyle=DANGER)
+            self.progress_bar["value"] = 0
+            self.percent_label.config(text="0%")
+            return
+
+        # Isi sendiri kolom File DPM - inti fitur ini memang menghapus langkah
+        # pilih-file manual yang rawan salah file/salah periode.
+        self.path_var.set(stat["path"])
+
+        self.progress_bar["value"] = 100
+        self.percent_label.config(text="100%")
+        self.status_label.config(text="File DLPD siap ✓", bootstyle=SUCCESS)
+
+        pesan = [
+            f"File tersimpan:\n{stat['path']}",
+            f"Baris DLPD   : {stat['n_dlpd']:,}",
+            f"Dapat kelainan_bc_meter: {stat['n_cocok']:,}",
+        ]
+        if stat["n_tak_cocok"]:
+            pesan.append(
+                f"Tanpa pasangan di DPM: {stat['n_tak_cocok']:,}\n"
+                f"(keterangan_dlpd-nya dibiarkan apa adanya)"
+            )
+        pesan.append("Kolom File DPM sudah terisi - tinggal tekan Jalankan.")
+        pesan.append(self._ringkasan_pagar(stat.get("pagar")))
+        messagebox.showinfo("Unduh DLPD Selesai", "\n\n".join(pesan))
+
+    @staticmethod
+    def _ringkasan_pagar(pagar):
+        """Teks ringkas Daftar Pagar Terkunci untuk messagebox Unduh DLPD."""
+        if not pagar:
+            return "Daftar Pagar Terkunci: tidak dibuat."
+        if pagar.get("error"):
+            return f"Daftar Pagar Terkunci: tidak dibuat ({pagar['error']})."
+        r = pagar["per_riwayat"]
+        baris = [
+            f"Daftar Pagar Terkunci: {pagar['n_total']:,} pelanggan",
+            f"  Stand 1: {pagar['n_stand1']:,}   Kode akses: {pagar['n_akses']:,}",
+            f"  Pertama {r['PERTAMA KALI']:,} | 2x {r['2 KALI']:,} | "
+            f"3x {r['3 KALI']:,} | >3x {r['LEBIH DARI 3 KALI']:,}",
+        ]
+        baris.append(pagar["path"])
+        return "\n".join(baris)
+
 
     # ── QUEUE PROCESSING ──────────────────────────────────
 
@@ -936,8 +1017,29 @@ class App:
                         self.eta_label.config(text=f"ETA: {data}")
 
                 elif kind == "simba_login_required":
-                    self.status_label.config(text="Menunggu login SIMBA...", bootstyle=WARNING)
+                    self.status_label.config(text="Menunggu login ACMT...", bootstyle=WARNING)
                     self._show_simba_login_dialog()
+
+                elif kind == "billing_login_required":
+                    self.status_label.config(
+                        text="Menunggu login portal billing...", bootstyle=WARNING
+                    )
+                    self._show_billing_login_dialog()
+
+                elif kind == "unit_berubah":
+                    self._perbarui_label_unit(data)
+
+                elif kind == "db_check_result":
+                    self._show_db_check_dialog(data)
+
+                elif kind == "db_update_done":
+                    self._finish_db_update(data)
+
+                elif kind == "unduh_dlpd_done":
+                    self._finish_unduh_dlpd(data)
+
+                elif kind.startswith("koreksi_"):
+                    self.halaman_koreksi.terima(kind, data)
 
                 elif kind == "verification_required":
                     self.status_label.config(text="Menunggu verifikasi database...", bootstyle=WARNING)

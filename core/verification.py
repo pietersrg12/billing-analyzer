@@ -11,6 +11,13 @@ kalau user memilih demikian.
 
 from core.photo import build_bulan_list
 
+# Sebuah bulan baru dianggap "ada" kalau jumlah barisnya minimal sekian kali
+# median jumlah baris per bulan di database itu. Tanpa ambang ini SATU baris
+# nyasar sudah cukup: 2026-09 satu baca susulan tanggal 1/08 membuat bulan
+# 202609 stan baca tampak lengkap, sehingga tombol Update tidak muncul dan
+# analisa 202610 memakai baca dua bulan lalu.
+RASIO_BULAN_MIN = 0.5
+
 
 def check_coverage(db_df, blth, n_bulan, idpel_list=None):
     """Return dict ringkasan coverage. db_df boleh None (db tidak tersedia).
@@ -36,7 +43,9 @@ def check_coverage(db_df, blth, n_bulan, idpel_list=None):
         }
 
     bulan_int = [int(b) for b in bulan_list]
-    present = set(db_df["BULAN"].astype(int).unique())
+    hitung = db_df["BULAN"].astype(int).value_counts()
+    ambang = hitung.median() * RASIO_BULAN_MIN
+    present = set(hitung[hitung >= ambang].index)
     missing_bulan = [b for b, bi in zip(bulan_list, bulan_int) if bi not in present]
 
     # Bulan yang hilang DB-WIDE dilaporkan lewat missing_bulan; hitungan

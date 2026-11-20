@@ -1,5 +1,6 @@
 """
-Rule settings (threshold deteksi anomali) — bisa diubah lewat UI.
+Rule settings (threshold deteksi anomali) dan setelan unduhan — bisa
+diubah lewat UI.
 
 Semua nilai di sini persis meniru konstanta yang sebelumnya hardcode di
 core/analyzer.py. Disimpan sebagai JSON di RULE_SETTINGS_FILE (folder data
@@ -11,27 +12,35 @@ menambah rule baru).
 import json
 import os
 
-from config import RULE_SETTINGS_FILE
+from config import RULE_SETTINGS_FILE, UNDUH_SETTINGS_FILE
+from core.pagar_terkunci import KODE_AKSES_DEFAULT
 
+# NOTE: setelan perbandingan pemakaian disimpan sebagai PERSEN, bukan pengali
+# (2026-08). Key-nya sengaja diganti nama saat konversi - kalau nama lama
+# dipertahankan, rule_settings.json lama yang berisi 1.5 akan terbaca sebagai
+# "1,5%" dan diam-diam mengubah hasil deteksi. Dengan nama baru, key lama
+# otomatis diabaikan load_rules() dan default baru yang dipakai.
 DEFAULT_RULES = {
     "jumlah_bulan_rata2": 6,
     "jam_nyala_tinggi_min": 720,
-    "jam_nyala_tidak_wajar_min": 744,
     "stand_p1_jam_konstan": 718,
     "kenaikan_pemakaian_min": 150,
-    "kenaikan_multiplier": 1.5,
-    "kenaikan_tambahan": 50,
-    "perlu_perhatian_ratio_min": 1.2,
-    "perlu_perhatian_ratio_max": 1.5,
-    "perlu_perhatian_pemakaian_min": 100,
-    "penurunan_ratio_max": 0.5,
-    "anomali_daya_multiplier": 2,
+    "kenaikan_persen_min": 50,      # dulu kenaikan_multiplier 1.5
+    "penurunan_persen_min": 50,     # dulu penurunan_ratio_max 0.5
     "trend_min_bulan": 3,
-    "trend_growth_ratio": 1.3,
+    "trend_persen_min": 30,         # dulu trend_growth_ratio 1.3
     "stand_tidak_wajar_toleransi": 1,
-    "stan_baca_flat_toleransi": 0,
-    "stan_baca_flat_min_bulan": 3,
-    "stan_baca_placeholder_max": 1,
+    "cabut_pasang_toleransi": 1,
+    # Tagih Ulang Pasca Nol: stand tagihan dianggap tidak didukung ACMT bila
+    # melewati stan meter ACMT lebih dari ini (stan ACMT <= 1 selalu kena).
+    "pasca_nol_toleransi_acmt": 50,
+    # Daftar Pagar Terkunci: STAN LALU di bawah ini = meter baru, stand 1-nya
+    # tidak dilaporkan (lihat core/pagar_terkunci.stand1_acmt).
+    "pagar_stan_lalu_meter_baru": 15,
+    # 1 = unduh foto SEMUA pelanggan termasuk Normal (lama & besar), 0 = hanya
+    # non-Normal + cabut/pasang bermasalah + prioritas KD BACA. Angka, bukan
+    # bool: dialog Pengaturan Rule memproses setiap isian dengan float().
+    "foto_semua_pelanggan": 0,
 }
 
 
@@ -75,3 +84,97 @@ def reset_rules():
         except OSError:
             pass
     return DEFAULT_RULES.copy()
+
+
+# =========================
+# SETELAN UNDUHAN DLPD
+# =========================
+# Disimpan TERPISAH dari DEFAULT_RULES, bukan digabung. Dialog Pengaturan Rule
+# memanggil float() atas setiap key-nya dan ui_dialogs.RULE_FIELD_GROUPS wajib sinkron
+# persis dengan DEFAULT_RULES - satu key bertipe list di sana langsung bikin
+# dialognya gagal dibuka.
+#
+# kd_proses_* menyimpan KODE-nya saja (T0, G1, ...), bukan bentuk lengkap
+# "44BIMT0". Kode lengkap disusun saat request sebagai unitap + kode, dan
+# unitap datang dari response login - jadi setelan yang sama otomatis benar
+# di unit mana pun.
+DEFAULT_UNDUH = {
+    # Unit yang sedang dikerjakan. Dinyatakan eksplisit, bukan ditebak dari
+    # token: token bisa saja milik unit lain (folder disalin, satu komputer
+    # dipakai dua orang), dan tebakan yang salah membuat Cek Database
+    # melaporkan "lengkap" untuk database yang bukan miliknya.
+    "unit_aktif": "",
+    "kd_proses_tersedia": ["T0", "T1", "T2", "T3", "T4", "T5",
+                           "G0", "G1", "PJ", "AP", "KI"],
+    "kd_proses_dipilih": ["T0", "T1", "T2"],
+    "dlpd": "SEMUA",
+    # Status verifikasi DLPD tidak lagi disetel di sini: Unduh DLPD selalu
+    # menarik BELUM + SUDAH (pipeline.STATUS_VERIFIKASI_DLPD). Setelan lama
+    # "BELUM" membuat unduhan gagal setelah periode billing, saat semua DLPD
+    # sudah diverifikasi.
+    "kodeposting_dpm": "SUDAH",
+    # Kode kelainan_bc_meter yang masuk Daftar Pagar Terkunci (aturan B).
+    # Dicocokkan toleran (awalan / mengandung, spasi diabaikan) - lihat
+    # core/pagar_terkunci.cocok_akses. Tambah ejaan lain di file JSON.
+    "kode_akses_pagar": list(KODE_AKSES_DEFAULT),
+}
+
+
+def load_unduh_settings():
+    """Baca setelan unduhan dari disk, merge di atas default."""
+    setelan = {k: (list(v) if isinstance(v, list) else v)
+               for k, v in DEFAULT_UNDUH.items()}
+
+    if not os.path.exists(UNDUH_SETTINGS_FILE):
+        return setelan
+
+    try:
+        with open(UNDUH_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return setelan
+
+    if not isinstance(saved, dict):
+        return setelan
+
+    for key, default in DEFAULT_UNDUH.items():
+        if key not in saved:
+            continue
+        nilai = saved[key]
+        # Tipe yang tidak cocok diabaikan, bukan dipaksa: file rusak/hasil edit
+        # tangan tidak boleh menjatuhkan aplikasi saat dialog dibuka.
+        if isinstance(default, list):
+            if isinstance(nilai, list):
+                setelan[key] = [str(x).strip().upper() for x in nilai if str(x).strip()]
+        elif isinstance(nilai, str):
+            setelan[key] = nilai
+
+    # Pilihan yang kodenya sudah dihapus dari daftar tersedia ikut dibuang,
+    # supaya tidak diam-diam terkirim ke server sebagai kode yang tak dikenal.
+    tersedia = set(setelan["kd_proses_tersedia"])
+    setelan["kd_proses_dipilih"] = [
+        k for k in setelan["kd_proses_dipilih"] if k in tersedia
+    ]
+
+    return setelan
+
+
+def set_unit_aktif(unit):
+    """Simpan unit yang sedang dikerjakan. Dipanggil setiap login berhasil."""
+    setelan = load_unduh_settings()
+    setelan["unit_aktif"] = str(unit or "").strip()
+    save_unduh_settings(setelan)
+    return setelan["unit_aktif"]
+
+
+def get_unit_aktif():
+    """Unit dari setelan, atau None kalau belum pernah ditetapkan."""
+    return load_unduh_settings().get("unit_aktif") or None
+
+
+def save_unduh_settings(setelan):
+    """Simpan setelan unduhan. Hanya key yang dikenal yang ditulis."""
+    to_save = {k: setelan[k] for k in DEFAULT_UNDUH if k in setelan}
+    os.makedirs(os.path.dirname(UNDUH_SETTINGS_FILE), exist_ok=True)
+    with open(UNDUH_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(to_save, f, indent=2)

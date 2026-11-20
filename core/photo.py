@@ -9,7 +9,8 @@ Kedua phase berjalan BERSAMAAN: begitu info per-IDPEL selesai, URL foto-nya
 langsung di-submit ke download pool tanpa menunggu seluruh info batch kelar.
 
 Photo file is shared between runs because struktur folder per BLTH foto
-(bukan per BLTH input). Kalau file sudah ada, skip.
+(bukan per BLTH input). Kalau file sudah ada DAN benar-benar gambar, skip;
+file yang bukan gambar dihapus lalu diunduh ulang (lihat _foto_valid).
 """
 
 import os
@@ -24,7 +25,7 @@ from datetime import datetime
 
 from dateutil.relativedelta import relativedelta
 
-from core.simba_client import SimbaAuthError, SimbaError
+from core.simba_client import SimbaAuthError, SimbaError, adalah_gambar
 
 
 def build_bulan_list(blth, n):
@@ -37,10 +38,26 @@ def _foto_path(foto_dir, blth, idpel):
     return os.path.join(foto_dir, blth, f"{idpel}.jpg")
 
 
-def _all_files_present(idpel, bulan_list, foto_dir):
-    return all(
-        os.path.exists(_foto_path(foto_dir, b, idpel)) for b in bulan_list
-    )
+def _foto_valid(path):
+    """True kalau file foto ada dan benar-benar gambar.
+
+    File yang ada tapi bukan gambar - mis. amplop JSON 432 byte yang tersimpan
+    sebagai .jpg sebelum download_foto mengikuti `urlPhoto` - dihapus supaya
+    diunduh ulang. Kalau hanya dicek keberadaannya, cache melewatinya selamanya
+    dan format_excel gagal saat menyisipkannya.
+    """
+    try:
+        with open(path, "rb") as f:
+            awal = f.read(4)
+    except OSError:
+        return False
+    if adalah_gambar(awal):
+        return True
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return False
 
 
 def download_photos(
@@ -67,7 +84,7 @@ def download_photos(
         existing = {}
         for b in bulan_list:
             p = _foto_path(foto_dir, b, idpel)
-            if os.path.exists(p):
+            if _foto_valid(p):
                 existing[b] = p
         existing_map[idpel] = existing
         if len(existing) != len(bulan_list):
@@ -204,7 +221,7 @@ def download_photos(
                                 if not url:
                                     continue
                                 target_path = _foto_path(foto_dir, b, idpel)
-                                if os.path.exists(target_path):
+                                if _foto_valid(target_path):
                                     existing_map.setdefault(idpel, {})[b] = target_path
                                     continue
                                 if dl_start is None:
@@ -264,7 +281,7 @@ def download_photos(
         per_idx = {}
         for i, b in enumerate(bulan_list, start=1):
             p = m.get(b)
-            if p and os.path.exists(p):
+            if p and _foto_valid(p):
                 per_idx[i] = p
         if per_idx:
             results[idpel] = per_idx

@@ -1,4 +1,4 @@
-# PLN Billing Analyzer
+﻿# PLN Billing Analyzer
 
 Aplikasi desktop untuk deteksi anomali tagihan listrik PLN. Membaca data pembacaan meter (file DPM), mendeteksi pola konsumsi abnormal berdasarkan data historis, mengunduh foto meter pelanggan dari portal PLN, dan mengekspor laporan Excel yang dikategorikan dengan foto tersemat.
 
@@ -78,7 +78,7 @@ billing-analyzer/
 ## Format Input
 
 ### Format DPM "Resmi"
-Kolom yang diperlukan: `IDPEL`, `SAHLWBP`, `LWBPPAKAI`, `DAYA`, `TARIF`, `KELAINAN_BC_METER`
+Kolom yang diperlukan: `idpel`, `sahlwbp`, `pemkwh`, `daya`, `tarif`, `keterangan_dlpd` (lihat `REQUIRED_COLS` di `core/loader.py`). `kelainan_bc_meter` tidak ada di export DLPD - kolom itu diambil dari export DPM dan digabungkan oleh fitur Unduh DLPD
 
 ### Format DPM "Belum"
 Kolom yang diperlukan: `IDPEL`, `STAN_METER`, `PEMKWH`, `DAYA`, `TARIF`, `KDBACA`
@@ -115,6 +115,10 @@ File hasil dikelompokkan dalam sheet:
 - **Normal** — Pelanggan tanpa anomali
 
 Setiap sheet dilengkapi warna status, heat map jam nyala, gradient persentase perubahan, sparkline historis, dan foto meter tersemat.
+
+### Daftar Pagar Terkunci (otomatis setelah Unduh DLPD)
+
+Setelah file DLPD gabungan jadi, aplikasi meminta login ACMT lalu menulis `hasil/<blth>/Pagar_Terkunci_<unit>_<blth>_<stempel>.xlsx`: pelanggan **stand ≤ 1** (ACMT, kecuali meter baru STAN LALU < 15) atau ber-**kode baca ACMT** akses (1-KWH METER TINGGI, 3-ANJING GALAK, E-RUMAH TUTUP, I-KWH METER DIDALAM BANGUNAN, W-BENCANA — bisa ditambah di `unduh_settings.json` → `kode_akses_pagar`), lengkap dengan berapa kali berulang dalam 6 bulan dan langkah tindak lanjut. Sheet: REKAP_BILLER, SEMUA, satu per biller, KRONIS. Login ACMT boleh di-Cancel: file DLPD tetap jadi, tetapi daftar tidak dibuat (kode kelainan billing sengaja tidak dipakai karena bisa berbeda dari kode baca ACMT).
 
 ## Autentikasi Portal
 

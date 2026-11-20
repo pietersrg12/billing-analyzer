@@ -262,6 +262,15 @@ def _make_result(main_row):
     """Build result dict from a filtered digit row."""
     if not main_row:
         return None
+    # Kelas >= 10 = digit desimal LCD (model putaran 2): ikut membentuk baris,
+    # tetapi bukan bagian stand. Ambang "baris cukup panjang" memakai n_kotak
+    # (termasuk desimal): LCD "323.76" punya 3 digit bulat + 2 desimal, dan
+    # bila yang dihitung hanya digit bulat, hasil crop yang sudah benar ditolak
+    # lalu diganti bacaan foto penuh yang acak (323 -> 464).
+    n_kotak = len(main_row)
+    main_row = [d for d in main_row if d["class"] < 10]
+    if not main_row:
+        return None
     digit_chars = [str(d["class"]) for d in main_row]
     confs = [d["confidence"] for d in main_row]
     avg_conf = float(np.mean(confs)) if confs else 0.0
@@ -271,6 +280,7 @@ def _make_result(main_row):
         "confidence": avg_conf,
         "digit_confs": list(zip(digit_chars, [round(c, 4) for c in confs])),
         "n_digits": len(digit_chars),
+        "n_kotak": n_kotak,
     }
 
 
@@ -323,10 +333,10 @@ def read_meter_digits(
             r = _make_result(main_row)
             if r is None:
                 continue
-            if best_result is None or r["n_digits"] > best_result["n_digits"]:
+            if best_result is None or r["n_kotak"] > best_result["n_kotak"]:
                 r["method"] = method_label
                 best_result = r
-            if r["n_digits"] >= 5:
+            if r["n_kotak"] >= 5:
                 r["method"] = method_label
                 return r
         return best_result
@@ -339,7 +349,7 @@ def read_meter_digits(
         cropped = _prepare_crop(img, display_box)
         if cropped is not None:
             result = _try_inference(cropped, "two_stage")
-            if result and result["n_digits"] >= 4:
+            if result and result["n_kotak"] >= 4:
                 return result
 
     # Fallback: deteksi langsung pada gambar penuh
