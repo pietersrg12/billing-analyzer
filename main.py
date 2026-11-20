@@ -62,6 +62,12 @@ def _set_window_icon(root):
 
 
 def main():
+    # Proses anak jendela login SSO portal billing (lihat core/sso_iam.py).
+    # Dicek paling awal: tidak butuh folder data maupun Tk.
+    if "--sso-login" in sys.argv:
+        from core.sso_iam import jalankan_dari_argv
+        sys.exit(jalankan_dari_argv(sys.argv))
+
     _ensure_user_dirs()
     _install_global_excepthook()
 

@@ -842,7 +842,7 @@ class DialogMixin:
         """Dialog kredensial portal billing. Blocking sampai user submit/cancel."""
 
         dialog = tb.Toplevel(self.root)
-        dialog.title("Login Portal Billing")
+        dialog.title("Login SSO Portal Billing")
         dialog.transient(self.root)
         dialog.grab_set()
         dialog.resizable(False, False)
@@ -852,57 +852,43 @@ class DialogMixin:
 
         tb.Label(
             frm,
-            text="Login Portal Billing",
+            text="Login SSO Portal Billing",
             font=("Segoe UI", 13, "bold"),
             bootstyle=PRIMARY,
         ).pack(anchor=W, pady=(0, 4))
 
         tb.Label(
             frm,
-            text="Dipakai untuk mengunduh database rekening "
-                 "(Monitoring Billing Detail).",
+            text="Dipakai untuk unduh database rekening, unduh DLPD, "
+                 "dan koreksi billing.",
             font=("Segoe UI", 9),
             bootstyle=SECONDARY,
             wraplength=430,
-        ).pack(anchor=W, pady=(0, 12))
-
-        tb.Label(frm, text="Username (NIP)", font=("Segoe UI", 9)).pack(anchor=W)
-        username_var = tk.StringVar()
-        user_entry = tb.Entry(frm, textvariable=username_var, width=44)
-        user_entry.pack(fill=X, pady=(2, 2))
-        tb.Label(
-            frm,
-            text="NIP portal billing, mis. 9716018H2Y - beda dari username ACMT.",
-            font=("Segoe UI", 8, "italic"),
-            bootstyle=SECONDARY,
         ).pack(anchor=W, pady=(0, 8))
 
-        tb.Label(frm, text="Password", font=("Segoe UI", 9)).pack(anchor=W)
-        password_var = tk.StringVar()
-        pass_entry = tb.Entry(frm, textvariable=password_var, show="•", width=44)
-        pass_entry.pack(fill=X, pady=(2, 8))
+        tb.Label(
+            frm,
+            text="Tempel kode enkripsi, lalu klik Lanjut. Jendela login IAM PLN "
+                 "akan terbuka - masuk dengan akun SSO PLN. Jendela itu "
+                 "menutup sendiri setelah login berhasil.",
+            font=("Segoe UI", 9),
+            wraplength=430,
+            justify=LEFT,
+        ).pack(anchor=W, pady=(0, 12))
 
         kode_var = self._buat_field_kode_enkripsi(frm)
 
         result = {"submitted": False}
 
         def submit():
-            u = username_var.get().strip()
-            p = password_var.get()
             k = kode_var.get().strip()
-            if not u or not p:
-                messagebox.showwarning(
-                    "Peringatan",
-                    "Username dan password tidak boleh kosong.",
-                    parent=dialog,
-                )
-                return
             if not k:
                 messagebox.showwarning(
                     "Peringatan", "Kode enkripsi tidak boleh kosong.", parent=dialog
                 )
                 return
-            self.billing_credentials_holder.set(u, p, k)
+            # Username/password tidak dipakai lagi: identitas datang dari SSO.
+            self.billing_credentials_holder.set("", "", k)
             result["submitted"] = True
             dialog.destroy()
 
@@ -914,7 +900,7 @@ class DialogMixin:
         btn_frame = tb.Frame(frm)
         btn_frame.pack(fill=X)
         tb.Button(
-            btn_frame, text="Login", command=submit, bootstyle=SUCCESS, width=12
+            btn_frame, text="Lanjut", command=submit, bootstyle=SUCCESS, width=12
         ).pack(side=RIGHT, padx=(8, 0))
         tb.Button(
             btn_frame, text="Batal", command=cancel, bootstyle=SECONDARY, width=12
@@ -927,7 +913,6 @@ class DialogMixin:
         x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
         y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
         dialog.geometry(f"+{x}+{y}")
-        user_entry.focus_set()
 
         dialog.wait_window()
 

@@ -77,6 +77,45 @@ def _read_excel_auto(path):
     return pd.read_excel(path)
 
 
+def baca_db_cache(path):
+    """Baca file database (rekening / stan baca) lewat cache pickle.
+
+    Database unit berukuran 6-10 MB xlsx dan butuh 10-50 detik untuk dibaca
+    openpyxl - setiap Jalankan dan setiap Unduh DLPD (pagar terkunci) membacanya
+    lagi. Cache disimpan di <APP_DATA_DIR>/cache/<nama>.pkl bersama mtime &
+    ukuran file sumber; file yang berubah (db_updater menulis lewat
+    os.replace, jadi mtime pasti berubah) otomatis dibaca ulang. Kegagalan apa
+    pun di sisi cache jatuh ke pembacaan xlsx biasa.
+    """
+    from config import user_path
+
+    try:
+        st = os.stat(path)
+        tanda = (st.st_mtime_ns, st.st_size)
+        folder = user_path("cache")
+        berkas = os.path.join(folder, os.path.basename(path) + ".pkl")
+    except OSError:
+        return _read_excel_auto(path)
+
+    try:
+        if os.path.exists(berkas):
+            isi = pd.read_pickle(berkas)
+            if isinstance(isi, dict) and isi.get("tanda") == tanda:
+                return isi["df"]
+    except Exception:  # noqa: BLE001 - cache rusak/versi pandas lain: baca ulang
+        pass
+
+    df = _read_excel_auto(path)
+    try:
+        os.makedirs(folder, exist_ok=True)
+        tmp = berkas + ".tmp"
+        pd.to_pickle({"tanda": tanda, "df": df}, tmp)
+        os.replace(tmp, berkas)
+    except Exception:  # noqa: BLE001 - cache hanya percepatan
+        pass
+    return df
+
+
 def read_blth(dpm_path):
     """Ambil BLTH (thblrek) dari file DPM untuk auto-fill UI.
 
@@ -158,7 +197,7 @@ def load_data(dpm_path, db_path):
     # mengunduh apa pun. Hasilnya semua baris jadi DATA BARU, dan dialog
     # verifikasi coverage sudah memperingatkan lebih dulu.
     if db_path and os.path.exists(db_path):
-        db = _read_excel_auto(db_path)
+        db = baca_db_cache(db_path)
     else:
         db = db_kosong()
 
@@ -239,7 +278,7 @@ def load_stanbaca_data(path, dengan_kd_baca=False):
         return None
 
     try:
-        sb = _read_excel_auto(path)
+        sb = baca_db_cache(path)
     except Exception:
         return None
 

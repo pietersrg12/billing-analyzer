@@ -51,6 +51,9 @@ membedakan aktivitas periode ini.
 
 import pandas as pd
 
+from core.analyzer import JAM_REKENING_MINIMUM
+from core.koreksi import is_pecahan
+
 # Kolom hasil dari modul ini (dipakai core/excel.py untuk menyusun sheet).
 KOLOM_CABUT_PASANG = (
     "STAND_AWAL", "STAND_CABUT", "STAND_PASANG",
@@ -109,6 +112,22 @@ def compute_cabut_pasang(df, cfg):
     hitung = (cabut - awal) + (kini - pasang)
     selisih = pakai - hitung
 
+    # Selisih yang memang dijelaskan billing bukan masalah stand:
+    # - rekening minimum: tagihan dinaikkan ke 40 jam nyala, jadi pemkwh >
+    #   hasil dua segmen (443200390253, 202611: hitung 78, ditagih 176 =
+    #   40 x 4,4 kVA, stand cabut/pasang benar);
+    # - rekening pecahan: pemakaian dibagi ke beberapa rekening.
+    # Survei seluruh sheet CABUT_PASANG v3/v4 (2026-11): 35 baris yang
+    # masalahnya HANYA selisih = 23 rekening minimum + 12 pecahan, dan
+    # semuanya dipilih BIARKAN oleh user.
+    if "JAM_NYALA" in df.columns:
+        jn = pd.to_numeric(df["JAM_NYALA"], errors="coerce")
+        minimum = (jn <= JAM_REKENING_MINIMUM) & (pakai > hitung)
+    else:
+        minimum = pd.Series(False, index=df.index)
+    pecahan = is_pecahan(df) if "KELAINAN" in df.columns else False
+    selisih_wajar = minimum | pecahan
+
     df["PEMAKAIAN_CABUT_PASANG"] = hitung.where(ada).round(0).astype("Int64")
     df["SELISIH_CABUT_PASANG"] = selisih.where(ada).round(0).astype("Int64")
 
@@ -117,7 +136,7 @@ def compute_cabut_pasang(df, cfg):
     for kondisi, teks in (
         (ada & ~df["CEK_CABUT"], MASALAH_CABUT),
         (ada & ~df["CEK_PASANG"], MASALAH_PASANG),
-        (ada & (selisih.abs() > tol), MASALAH_SELISIH),
+        (ada & (selisih.abs() > tol) & ~selisih_wajar, MASALAH_SELISIH),
     ):
         masalah = masalah.where(~kondisi, (masalah + " | " + teks).str.strip(" |"))
 

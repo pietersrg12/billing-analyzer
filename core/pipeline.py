@@ -44,13 +44,15 @@ from core.analyzer import (
     apply_analysis,
     compute_stanbaca_comparison,
     prepare,
+    STATUS_REKENING_MINIMUM,
     tandai_tagih_ulang_pasca_nol,
 )
 from core.cabut_pasang import compute_cabut_pasang, ringkasan as ringkasan_cabut_pasang
 from core.classifier import classify_all, is_available as classifier_available
 from core.excel import export_excel, format_excel
 from core.koreksi import tambah_saran_koreksi
-from core.billing_client import BillingAuthError, BillingClient
+from core.billing_client import BillingAuthError, BillingClient, BillingError
+from core import sso_iam
 from core.db_updater import (
     DbUpdateError,
     append_rekening,
@@ -58,11 +60,12 @@ from core.db_updater import (
     parse_billing_export,
     parse_kode_baca_export,
 )
-from core.dlpd_merge import gabung_dlpd_dpm
+from core.dlpd_merge import gabung_dlpd_dpm, gabung_file_dlpd
 from core import pagar_terkunci as pt
 from core.pagar_terkunci import parse_acmt_lengkap
 from core.loader import (
     _read_excel_auto,
+    baca_db_cache,
     load_data,
     load_stanbaca_data,
     read_unitup,
@@ -71,6 +74,10 @@ from core.photo import download_photos
 from core.reader import is_available as reader_available
 from core.reader import read_meter_batch
 from core.simba_client import SimbaAuthError, SimbaClient, SimbaError
+
+# statusVerifikasiDlpd yang ditarik Unduh DLPD, berurutan: kalau satu IDPEL ada
+# di keduanya, baris status terakhir (SUDAH) yang dipakai.
+STATUS_VERIFIKASI_DLPD = ("BELUM", "SUDAH")
 
 
 def unit_dari_token():
@@ -260,13 +267,15 @@ def _target_foto(df, cfg):
         mask = pd.Series(True, index=df.index)
         cakupan = "SEMUA pelanggan - saklar foto semua aktif"
     else:
-        mask = df["STATUS"] != "Normal"
+        # Rekening Minimum tidak perlu foto: tagihannya wajar (minimum 40 jam).
+        mask = ~df["STATUS"].isin(["Normal", STATUS_REKENING_MINIMUM])
         if "MASALAH_CABUT_PASANG" in df.columns:
             mask = mask | (df["MASALAH_CABUT_PASANG"] != "")
         if "KD_BACA_ACMT" in df.columns:
             huruf = df["KD_BACA_ACMT"].fillna("").map(pt.huruf_kode_baca)
             mask = mask | huruf.isin(pt.KODE_PRIORITAS)
-        cakupan = "non-Normal + cabut/pasang bermasalah + prioritas KD BACA"
+        cakupan = ("non-Normal (kecuali Rekening Minimum) + cabut/pasang "
+                   "bermasalah + prioritas KD BACA")
     df_foto = df[mask].copy()
     df_foto["IDPEL"] = df_foto["IDPEL"].astype(str)
     df_foto.attrs["cakupan"] = cakupan
@@ -740,7 +749,7 @@ def run_db_check(blth, unitup=None, progress_callback=None):
         log("Database rekening unit ini belum ada")
     else:
         try:
-            terbaca = _read_excel_auto(berkas_db)
+            terbaca = baca_db_cache(berkas_db)
             terbaca["BULAN"] = terbaca["BULAN"].astype(int)
             db = terbaca
             log(f"Database rekening: {len(db):,} baris ({os.path.basename(berkas_db)})")
@@ -825,17 +834,28 @@ def _get_billing_client(progress_callback, login_event, credentials_holder,
     if not creds:
         raise BillingAuthError("Login billing dibatalkan oleh user")
 
-    username = creds.get("username", "").strip()
-    password = creds.get("password", "")
     token_info = (creds.get("token_info") or "").strip()
-
-    if not username or not password:
-        raise BillingAuthError("Username/password billing kosong")
     if not token_info:
         raise BillingAuthError("Kode enkripsi billing kosong")
 
-    log(f"Login ke portal billing sebagai {username}...")
-    client.login(username, password, token_info)
+    # Portal newap2t mewajibkan SSO IAM. Kode enkripsi diminta SEBELUM jendela
+    # dibuka karena kode OAuth dari IAM berumur pendek: begitu tertangkap,
+    # langsung ditukar.
+    url_sso = client.sso_url()
+    log("Membuka jendela login SSO IAM PLN...")
+    try:
+        kode = sso_iam.minta_kode(url_sso)
+    except sso_iam.SsoError as e:
+        raise BillingError(str(e))
+    if not kode:
+        raise BillingAuthError("Login SSO dibatalkan oleh user")
+
+    if kode.get("code"):
+        log("Kode SSO diterima, menukar ke token portal billing...")
+        client.login_sso(kode["code"], kode["session_state"], token_info)
+    else:
+        log("Token diambil dari halaman AP2T di jendela SSO")
+        client.pakai_token(kode["token"], kode["account"])
     client.save_token(BILLING_TOKEN_FILE)
     _catat_unit_login(client.unitup, "portal billing", log)
     log(f"Login billing berhasil ({client.nama} - unit {client.unitup})")
@@ -1151,8 +1171,38 @@ def run_unduh_dlpd(
     # memecah set itu ke dua stempel.
     stempel = _stempel_waktu()
 
+    # Daftar pagar terkunci butuh ACMT (login + ~100 s unduhan) yang TIDAK
+    # bergantung pada file DLPD - file itu baru dipakai saat menyusun daftar.
+    # Jadi bagian ACMT dijalankan di thread sendiri begitu unit diketahui
+    # (sesudah login billing), bersamaan dengan unduhan billing; dialog login
+    # ACMT muncul di awal, bukan setelah DLPD selesai.
+    pf = {}
+    batal_pf = threading.Event()
+
+    def stop_pf():
+        return batal_pf.is_set() or bool(stop_flag and stop_flag())
+
+    def mulai_prefetch(unit, folder):
+        if "thread" in pf:  # kerja diulang setelah login ulang billing
+            return
+
+        def jalan():
+            try:
+                pf["hasil"] = _siapkan_pagar_terkunci(
+                    blth, unit, folder, stempel, progress_callback, stop_pf,
+                    login_event, credentials_holder,
+                )
+            except _Dibatalkan:
+                pf["error"] = "dibatalkan"
+            except Exception as e:  # noqa: BLE001 - pagar tidak boleh menggagalkan DLPD
+                pf["error"] = str(e)
+
+        t = threading.Thread(target=jalan, name="pagar-acmt", daemon=True)
+        pf["thread"] = t
+        t.start()
+
     def kerja(client):
-        """Unduh kedua export. Dipisah jadi fungsi supaya bisa diulang utuh
+        """Unduh semua export. Dipisah jadi fungsi supaya bisa diulang utuh
         setelah login ulang - token baru berarti seluruh rangkaian request
         harus dijalankan lagi, bukan disambung di tengah."""
         if stop_flag and stop_flag():
@@ -1162,6 +1212,7 @@ def run_unduh_dlpd(
         folder = _folder_unduhan(client, blth)
         os.makedirs(folder, exist_ok=True)
         jalur["unit"] = client.unitup
+        mulai_prefetch(client.unitup, folder)
         sufiks = _sufiks_kode(kd_proses)
         jalur["dlpd"] = os.path.join(
             folder, f"Monitoring_Dlpd_Detail_{blth}{sufiks}_{stempel}.xlsx")
@@ -1170,19 +1221,35 @@ def run_unduh_dlpd(
         jalur["keluar"] = os.path.join(
             folder, f"DLPD_{blth}{sufiks}_gabungan_{stempel}.xlsx")
 
+        # DLPD ditarik sekali per status verifikasi lalu disatukan: sebelum
+        # billing hampir semua DLPD masih BELUM, sesudahnya semuanya SUDAH.
+        # Status tanpa data cukup dicatat; gagal hanya kalau semuanya kosong.
+        def unduh_dlpd(status):
+            path = os.path.join(
+                folder,
+                f"Monitoring_Dlpd_Detail_{blth}{sufiks}_{status}_{stempel}.xlsx")
+            try:
+                n = client.download_dlpd_detail(
+                    blth, kd_proses, path,
+                    dlpd=setelan["dlpd"],
+                    status_verifikasi=status,
+                    catat=log,
+                )
+            except BillingAuthError:
+                raise
+            except BillingError as e:
+                log(f"  DLPD status verifikasi {status}: tidak ada/ditolak - {e}")
+                return None, f"{status}: {e}"
+            if n == 0:
+                log(f"  DLPD status verifikasi {status}: 0 baris - dilewati")
+                return None, f"{status}: 0 baris"
+            log(f"  file DLPD status verifikasi {status} diterima "
+                f"{n / 1048576:.1f} MB")
+            return path, None
+
         # DPM ditarik dengan Kd Proses yang SAMA supaya setiap baris DLPD punya
         # peluang ketemu pasangannya; kalau pilihannya berbeda, sebagian baris
         # pasti tidak cocok bukan karena datanya memang tidak ada.
-        def unduh_dlpd():
-            n = client.download_dlpd_detail(
-                blth, kd_proses, jalur["dlpd"],
-                dlpd=setelan["dlpd"],
-                status_verifikasi=setelan["status_verifikasi_dlpd"],
-                catat=log,
-            )
-            log(f"  file DLPD diterima {n / 1048576:.1f} MB")
-            return n
-
         def unduh_dpm():
             n = client.download_dpm_detail(
                 blth, kd_proses, jalur["dpm"],
@@ -1192,48 +1259,69 @@ def run_unduh_dlpd(
             log(f"  file DPM diterima {n / 1048576:.1f} MB")
             return n
 
+        hasil_dlpd = {}
         if ENABLE_UNDUH_PARALEL:
-            # DLPD & DPM independen dan waktunya didominasi generate di server;
-            # dijalankan bersamaan pada client yang sama. BillingAuthError dari
-            # salah satunya sengaja digelembungkan keluar supaya _kerja_billing
-            # login ulang lalu menjalankan SELURUH kerja lagi (bukan disambung).
-            log(f"Unduh export DLPD + DPM {blth} paralel "
-                f"(unit {client.unitap}/{client.unitup})...")
+            # Semua export independen dan waktunya didominasi server (hitung-
+            # total DLPD BELUM pernah 128 s untuk 0 baris); dijalankan
+            # bersamaan pada client yang sama. BillingAuthError dari salah
+            # satunya sengaja digelembungkan keluar supaya _kerja_billing login
+            # ulang lalu menjalankan SELURUH kerja lagi (bukan disambung).
+            log(f"Unduh export DLPD ({' + '.join(STATUS_VERIFIKASI_DLPD)}) + DPM "
+                f"{blth} paralel (unit {client.unitap}/{client.unitup})...")
             percent(10)
-            with ThreadPoolExecutor(max_workers=2,
+            jumlah = len(STATUS_VERIFIKASI_DLPD) + 1
+            with ThreadPoolExecutor(max_workers=jumlah,
                                     thread_name_prefix="unduh") as pool:
-                futs = {
-                    pool.submit(unduh_dlpd): "DLPD",
-                    pool.submit(unduh_dpm): "DPM",
-                }
+                futs = {pool.submit(unduh_dlpd, s): s for s in STATUS_VERIFIKASI_DLPD}
+                futs[pool.submit(unduh_dpm)] = "DPM"
                 selesai = 0
                 for fut in as_completed(futs):
-                    fut.result()  # re-raise; BillingAuthError naik ke _kerja_billing
+                    hasil = fut.result()  # re-raise; BillingAuthError naik ke _kerja_billing
+                    if futs[fut] != "DPM":
+                        hasil_dlpd[futs[fut]] = hasil
                     selesai += 1
-                    percent(40 if selesai == 1 else 70)
+                    percent(10 + 60 * selesai // jumlah)
         else:
             log(f"Unduh export DLPD {blth} "
                 f"(unit {client.unitap}/{client.unitup})...")
             percent(10)
-            unduh_dlpd()
+            for status in STATUS_VERIFIKASI_DLPD:
+                hasil_dlpd[status] = unduh_dlpd(status)
+                if stop_flag and stop_flag():
+                    log("Dibatalkan")
+                    return None
             percent(40)
-            if stop_flag and stop_flag():
-                log("Dibatalkan")
-                return None
             log(f"Unduh export DPM {blth} (untuk kolom kelainan_bc_meter)...")
             unduh_dpm()
             percent(70)
+
+        # Urutan STATUS_VERIFIKASI_DLPD dipertahankan: IDPEL ganda diambil
+        # dari status terakhir (SUDAH).
+        berhasil = {s: hasil_dlpd[s][0] for s in STATUS_VERIFIKASI_DLPD
+                    if hasil_dlpd.get(s, (None, None))[0]}
+        if not berhasil:
+            raise BillingError(
+                "Export DLPD kosong/gagal untuk semua status verifikasi: "
+                + "; ".join(hasil_dlpd[s][1] for s in STATUS_VERIFIKASI_DLPD
+                            if s in hasil_dlpd))
+        stat_dlpd = gabung_file_dlpd(berhasil, jalur["dlpd"])
+        rinci = ", ".join(f"{s} {stat_dlpd[s]:,}" for s in berhasil)
+        log(f"  DLPD digabung: {rinci} -> {stat_dlpd['n_total']:,} baris")
 
         if stop_flag and stop_flag():
             log("Dibatalkan")
             return None
         return True
 
-    if _kerja_billing(kerja, progress_callback,
-                      billing_login_event, billing_credentials_holder) is None:
-        return None
-
-    if stop_flag and stop_flag():
+    try:
+        hasil_kerja = _kerja_billing(kerja, progress_callback,
+                                     billing_login_event, billing_credentials_holder)
+    except BaseException:
+        # Unduhan billing gagal: hentikan bagian ACMT di titik cek berikutnya.
+        batal_pf.set()
+        raise
+    if hasil_kerja is None or (stop_flag and stop_flag()):
+        batal_pf.set()
         log("Dibatalkan")
         return None
 
@@ -1257,20 +1345,32 @@ def run_unduh_dlpd(
     # sini tidak boleh membuat file DLPD yang sudah jadi dianggap gagal.
     stat["pagar"] = None
     if stop_flag and stop_flag():
+        batal_pf.set()
         log("Dibatalkan - daftar pagar terkunci dilewati")
     else:
-        try:
-            stat["pagar"] = _buat_pagar_terkunci(
-                blth, jalur["unit"], jalur["keluar"], stempel,
-                progress_callback, stop_flag, login_event, credentials_holder,
-                kd_proses,
-            )
-        except _Dibatalkan:
-            log("Dibatalkan - daftar pagar terkunci dilewati")
-            stat["pagar"] = {"error": "dibatalkan"}
-        except Exception as e:
-            log(f"ERROR daftar pagar terkunci: {e}")
-            stat["pagar"] = {"error": str(e)}
+        t = pf.get("thread")
+        if t is not None and t.is_alive():
+            log("Menunggu unduhan ACMT untuk daftar pagar terkunci...")
+            t.join()
+        if "error" in pf or "hasil" not in pf:
+            alasan = pf.get("error", "data ACMT tidak tersedia")
+            if alasan == "dibatalkan":
+                log("Dibatalkan - daftar pagar terkunci dilewati")
+            else:
+                log(f"ERROR daftar pagar terkunci: {alasan}")
+            stat["pagar"] = {"error": alasan}
+        else:
+            try:
+                stat["pagar"] = _susun_pagar_terkunci(
+                    blth, jalur["unit"], jalur["keluar"], stempel, pf["hasil"],
+                    progress_callback, stop_flag, kd_proses,
+                )
+            except _Dibatalkan:
+                log("Dibatalkan - daftar pagar terkunci dilewati")
+                stat["pagar"] = {"error": "dibatalkan"}
+            except Exception as e:
+                log(f"ERROR daftar pagar terkunci: {e}")
+                stat["pagar"] = {"error": str(e)}
     percent(100)
 
     return stat
@@ -1423,28 +1523,20 @@ def _master_pelanggan(unit, log):
     return pt.rapikan_master(df)
 
 
-def _buat_pagar_terkunci(blth, unit, path_gabungan, stempel, progress_callback,
-                         stop_flag, login_event, credentials_holder, kd_proses=None):
-    """Bangun Daftar Pagar Terkunci dari DLPD gabungan + ACMT + database.
+def _siapkan_pagar_terkunci(blth, unit, folder, stempel, progress_callback,
+                            stop_flag, login_event, credentials_holder):
+    """Bagian Daftar Pagar Terkunci yang tidak butuh file DLPD: database stan
+    baca + sesi ACMT (bulan ini & riwayat). run_unduh_dlpd menjalankannya di
+    thread sendiri, bersamaan dengan unduhan billing.
 
-    Return dict ringkasan untuk messagebox "Unduh DLPD Selesai".
+    Return dict untuk _susun_pagar_terkunci.
     """
 
     def log(msg):
         if progress_callback:
             progress_callback(("log", msg))
 
-    def percent(p):
-        if progress_callback:
-            progress_callback(("percent", p))
-
-    log(f"=== DAFTAR PAGAR TERKUNCI {blth} ===")
-    folder = os.path.dirname(path_gabungan)
-    daftar = (settings.load_unduh_settings().get("kode_akses_pagar")
-              or list(pt.KODE_AKSES_DEFAULT))
-
-    batas_baru = settings.load_rules()["pagar_stan_lalu_meter_baru"]
-    dlpd = _read_excel_auto(path_gabungan)
+    log(f"=== DAFTAR PAGAR TERKUNCI {blth}: ACMT (paralel dengan unduhan billing) ===")
 
     # Database stan baca dibaca dulu: KD BACA + STAN METER-nya adalah data
     # ACMT yang sudah tersimpan, jadi bulan yang lengkap di sana tidak perlu
@@ -1466,6 +1558,46 @@ def _buat_pagar_terkunci(blth, unit, path_gabungan, stempel, progress_callback,
         blth, unit, folder, stempel, progress_callback, stop_flag,
         login_event, credentials_holder, bulan_di_db,
     )
+    return {"db_sb": db_sb, "bulan_di_db": bulan_di_db, "acmt_ini": acmt_ini,
+            "acmt_lalu": acmt_lalu, "alasan": alasan}
+
+
+def _buat_pagar_terkunci(blth, unit, path_gabungan, stempel, progress_callback,
+                         stop_flag, login_event, credentials_holder, kd_proses=None):
+    """Bangun Daftar Pagar Terkunci berurutan (ACMT lalu susun)."""
+    siap = _siapkan_pagar_terkunci(
+        blth, unit, os.path.dirname(path_gabungan), stempel, progress_callback,
+        stop_flag, login_event, credentials_holder,
+    )
+    return _susun_pagar_terkunci(blth, unit, path_gabungan, stempel, siap,
+                                 progress_callback, stop_flag, kd_proses)
+
+
+def _susun_pagar_terkunci(blth, unit, path_gabungan, stempel, siap,
+                          progress_callback, stop_flag, kd_proses=None):
+    """Susun Daftar Pagar Terkunci dari DLPD gabungan + hasil
+    _siapkan_pagar_terkunci + database rekening.
+
+    Return dict ringkasan untuk messagebox "Unduh DLPD Selesai".
+    """
+
+    def log(msg):
+        if progress_callback:
+            progress_callback(("log", msg))
+
+    def percent(p):
+        if progress_callback:
+            progress_callback(("percent", p))
+
+    log(f"=== DAFTAR PAGAR TERKUNCI {blth}: susun daftar ===")
+    daftar = (settings.load_unduh_settings().get("kode_akses_pagar")
+              or list(pt.KODE_AKSES_DEFAULT))
+
+    batas_baru = settings.load_rules()["pagar_stan_lalu_meter_baru"]
+    dlpd = _read_excel_auto(path_gabungan)
+    db_sb = siap["db_sb"]
+    bulan_di_db = siap["bulan_di_db"]
+    acmt_ini, acmt_lalu, alasan = siap["acmt_ini"], siap["acmt_lalu"], siap["alasan"]
     percent(88)
     # Kedua aturan bersumber dari ACMT. Tanpa ACMT bulan ini daftar TIDAK
     # dibuat - kelainan_bc_meter billing sengaja tidak dipakai sebagai
@@ -1514,7 +1646,7 @@ def _buat_pagar_terkunci(blth, unit, path_gabungan, stempel, progress_callback,
     if berkas:
         log(f"Membaca database rekening {os.path.basename(berkas)}...")
         try:
-            db_rek = _read_excel_auto(berkas)[["IDPEL", "BULAN", "STAND"]]
+            db_rek = baca_db_cache(berkas)[["IDPEL", "BULAN", "STAND"]]
         except Exception as e:
             log(f"  database rekening tidak terbaca ({e})")
     else:

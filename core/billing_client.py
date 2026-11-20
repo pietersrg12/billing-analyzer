@@ -4,8 +4,12 @@ Client portal billing PLN (host 10.68.35.109) - sumber `database.xlsb`.
 Sistem ini TERPISAH dari SIMBA/ACMT (core/simba_client.py): host beda, token
 beda, dan skema login-nya beda. Dua port dipakai:
 
-- POST {AUTH}/auth/login-v2
+- GET  {AUTH}/sso                -> URL authorize IAM PLN (SSO)
+- POST {AUTH}/sso/exchange       {code, session_state, tokenDeviceInfo}
       -> bearer token + kode unit (unitupi/unitap/unitup)
+  Sejak 2026-11 portal (newap2t) mewajibkan SSO IAM; login-v2 dengan
+  NIP/password tidak dipakai lagi. Kode `code` ditangkap dari redirect IAM
+  oleh jendela login bawaan (core/sso_iam.py).
 - POST {API}/api/monitoring/billing/monitoring-billing-detail-export
 - POST {API}/api/monitoring/billing/monitoring-dlpd-detail-export
 - POST {API}/api/monitoring-dpm-detail/export
@@ -13,12 +17,9 @@ beda, dan skema login-nya beda. Dua port dipakai:
   Tiap export punya endpoint list pasangannya yang mengembalikan
   `totalItems`, dipakai untuk mengisi `size` payload export.
 
-Soal `tokenInfo`: portal ini menuntut blob base64 384 byte yang dibuat
-generator milik masing-masing user. Blob itu TIDAK bisa dihitung dari
-username/password saja, jadi aplikasi hanya meneruskan apa yang di-paste user
-di dialog login. Password plaintext tetap ikut dikirim - persis seperti yang
-dilakukan portal web-nya, jadi `tokenInfo` berfungsi sebagai amplop
-anti-replay, bukan penyembunyi password.
+Soal kode enkripsi (`tokenDeviceInfo`): portal menuntut blob base64 384 byte
+yang dibuat generator milik masing-masing user. Blob itu TIDAK bisa dihitung,
+jadi aplikasi hanya meneruskan apa yang di-paste user di dialog login.
 """
 
 import base64
@@ -87,51 +88,115 @@ class BillingClient:
     # AUTH
     # =========================
 
-    def login(self, username, password, token_info):
-        """Login ke portal billing. `token_info` = kode enkripsi dari user."""
-        url = f"{self.auth_url}/auth/login-v2"
-        payload = {
-            "username": username,
-            "password": password,
-            "tokenInfo": token_info,
-        }
+    def sso_url(self):
+        """URL halaman login IAM PLN, diminta dari portal (`GET /sso`).
 
+        Portal menjawab string JSON polos berisi URL authorize IAM, lengkap
+        dengan client_id dan redirect_uri milik newap2t. URL tidak dirakit
+        sendiri supaya perubahan client_id di server ikut terbawa.
+        """
+        try:
+            resp = self.session.get(f"{self.auth_url}/sso", timeout=30)
+        except requests.RequestException as e:
+            raise BillingError(f"Tidak bisa terhubung ke portal billing: {e}")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = resp.text
+        if isinstance(data, dict):
+            data = data.get("data")
+        url = str(data or "").strip()
+        if resp.status_code != 200 or not url.startswith("http"):
+            raise BillingError(
+                f"URL login SSO tidak didapat (HTTP {resp.status_code}): "
+                f"{(resp.text or '')[:200]}"
+            )
+        return url
+
+    def login_sso(self, code, session_state, token_info):
+        """Tukar kode SSO IAM menjadi token portal (`POST /sso/exchange`).
+
+        `token_info` = kode enkripsi dari Generator Enkripsi; field-nya bernama
+        `tokenDeviceInfo` di sini, bukan `tokenInfo` seperti login-v2. Kode
+        OAuth berumur pendek, jadi fungsi ini dipanggil segera setelah kode
+        tertangkap.
+        """
+        url = f"{self.auth_url}/sso/exchange"
+        payload = {
+            "code": code,
+            "session_state": session_state or "",
+            "tokenDeviceInfo": token_info,
+        }
         try:
             resp = self.session.post(url, json=payload, timeout=60)
         except requests.RequestException as e:
             raise BillingError(f"Tidak bisa terhubung ke portal billing: {e}")
+        self._terima_login(resp, "Login SSO")
 
-        if resp.status_code != 200:
-            raise BillingAuthError(
-                f"Login billing gagal (HTTP {resp.status_code}): {resp.text[:200]}"
-            )
+    def pakai_token(self, token, account_json):
+        """Pakai token yang sudah ditukar oleh halaman AP2T sendiri.
 
+        Terjadi kalau user sempat mengisi enkripsi di halaman redirect-login
+        di jendela SSO: kodenya sudah terpakai, tetapi SPA menyimpan token dan
+        akun (bentuk `data` respons login) di localStorage.
+        """
+        try:
+            akun = json.loads(account_json) if account_json else {}
+        except ValueError:
+            akun = {}
+        if not isinstance(akun, dict):
+            akun = {}
+        self._terapkan_akun({**akun, "token": token}, "Login SSO")
+
+    def _terima_login(self, resp, label):
+        """Baca respons login (bentuknya sama dengan login-v2): simpan token,
+        identitas, dan kode unit."""
         try:
             data = resp.json()
         except ValueError:
-            raise BillingAuthError("Response login billing bukan JSON valid")
-
-        if not data.get("success"):
             raise BillingAuthError(
-                f"Login billing gagal: {data.get('message', 'Unknown error')}"
+                f"{label} gagal (HTTP {resp.status_code}): {(resp.text or '')[:200]}"
+            )
+        if not isinstance(data, dict):
+            raise BillingAuthError(f"{label} gagal: respons tak dikenal {str(data)[:200]}")
+
+        # Frontend memeriksa `status === 200`; login-v2 lama memakai `success`.
+        ok = data.get("success") is True or str(data.get("status")) == "200"
+        if resp.status_code != 200 or not ok:
+            raise BillingAuthError(
+                f"{label} gagal (HTTP {resp.status_code}): "
+                f"{data.get('message') or str(data)[:200]}"
             )
 
         d = data.get("data") or {}
-        token = d.get("token") or data.get("token")
-        if not token:
-            raise BillingAuthError("Token tidak ditemukan di response login billing")
+        if not isinstance(d, dict):
+            d = {}
+        self._terapkan_akun({**d, "token": d.get("token") or data.get("token")}, label)
 
-        self.username = username
+    def _terapkan_akun(self, d, label):
+        """Simpan token, identitas, dan kode unit dari dict akun portal."""
+        token = d.get("token")
+        if not token:
+            raise BillingAuthError(f"Token tidak ditemukan di respons {label.lower()}")
+
+        identitas = identitas_token(token)
+        self.username = (
+            d.get("username") or d.get("nip") or identitas.get("nip")
+            or identitas.get("userId")
+        )
         self.token = token
-        self.nama = d.get("nama")
+        self.nama = d.get("nama") or identitas.get("nama")
         self.unitupi = d.get("unitupi")
         self.unitap = d.get("unitap")
-        self.unitup = d.get("unitup") or d.get("unit")
+        self.unitup = d.get("unitup") or d.get("unit") or identitas.get("unit")
 
+        if not self.username:
+            self.username = "sso"
         if not (self.unitupi and self.unitap and self.unitup):
             raise BillingAuthError(
-                "Response login tidak memuat kode unit (unitupi/unitap/unitup); "
-                "export tidak bisa dijalankan."
+                f"Respons {label.lower()} tidak memuat kode unit "
+                f"(unitupi/unitap/unitup); export tidak bisa dijalankan. "
+                f"Kunci yang ada: {sorted(d)}"
             )
 
         self.session.headers.update({"authorization": f"Bearer {token}"})
@@ -281,7 +346,10 @@ class BillingClient:
             total = int(data)
         except (TypeError, ValueError):
             return None
-        return total if total > 0 else None
+        # 0 dikembalikan apa adanya (bukan None): caller DLPD memakainya untuk
+        # melewati export yang pasti kosong. Caller lain memakai `total or
+        # cadangan`, jadi bagi mereka 0 tetap berarti "pakai angka cadangan".
+        return total if total >= 0 else None
 
     def _unduh_export(self, path_export, payload, save_path, label, timeout=600):
         """POST export lalu simpan .xlsx biner ke save_path. Return jumlah byte."""
@@ -402,6 +470,15 @@ class BillingClient:
             t0 = time.perf_counter()
             total = self.hitung_total(self.URL_LIST_DLPD, payload)
             t_count = time.perf_counter() - t0
+            if total == 0:
+                # Endpoint list sendiri bilang tidak ada data (mis. status BELUM
+                # setelah periode billing). Export-nya tidak diminta: hasilnya
+                # paling-paling workbook kosong, dan pernah juga HTTP 500 dari
+                # proxy setelah menunggu 1,5 menit (202611, 2026-11-20).
+                if catat:
+                    catat(f"    ({label} status {status_verifikasi}: 0 baris "
+                          f"menurut hitung-total {t_count:.1f}s - export dilewati)")
+                return 0
             payload["size"] = total or 100000
         t1 = time.perf_counter()
         n = self._unduh_export(self.URL_EXPORT_DLPD, payload, save_path,
@@ -470,6 +547,19 @@ def _pesan_respons(resp):
     if isinstance(data, dict):
         return str(data.get("message") or data.get("error") or "")[:200]
     return str(data)[:200]
+
+
+def identitas_token(token):
+    """{userId, nama, nip, unit} dari klaim `user` JWT. Kosong kalau tidak terbaca."""
+    try:
+        bagian = token.split(".")[1]
+        bagian += "=" * (-len(bagian) % 4)
+        user = json.loads(base64.urlsafe_b64decode(bagian)).get("user") or {}
+    except (AttributeError, IndexError, ValueError):
+        return {}
+    if not isinstance(user, dict):
+        return {}
+    return {k: user.get(k) for k in ("userId", "nama", "nip", "unit")}
 
 
 def _jwt_exp(token):

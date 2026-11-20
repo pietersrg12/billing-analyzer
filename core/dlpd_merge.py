@@ -40,6 +40,46 @@ def _wajib(kol, nama_file, dibutuhkan):
         )
 
 
+def gabung_file_dlpd(paths, path_keluar):
+    """Satukan beberapa export DLPD (mis. status verifikasi BELUM + SUDAH).
+
+    `paths` = {label: path}. IDPEL ganda dibuang dengan keep="last", jadi urutan
+    dict menentukan pemenangnya (SUDAH ditaruh terakhir). Return
+    {label: n_baris, ..., "n_total": n_setelah_dedupe}.
+    """
+    frames = []
+    stat = {}
+    for label, path in paths.items():
+        try:
+            df = _read_excel_auto(path)
+        except Exception as e:
+            raise DbUpdateError(f"Tidak bisa membaca export DLPD {label}: {e}")
+        # Status tanpa data dikirim server sebagai workbook KOSONG - bahkan
+        # tanpa baris header (mis. BELUM setelah periode billing, saat semua
+        # DLPD sudah diverifikasi). Itu berarti 0 baris, bukan file rusak.
+        if df.empty and len(df.columns) <= 1:
+            stat[label] = 0
+            continue
+        _wajib(_kolom_lower(df), os.path.basename(path), ("idpel",))
+        # Nama kolom diseragamkan ke huruf kecil supaya concat tidak memecah
+        # kolom yang sama menjadi dua hanya karena beda kapitalisasi.
+        df = df.rename(columns=lambda c: str(c).strip().lower())
+        stat[label] = len(df)
+        frames.append(df)
+
+    if not frames:
+        raise DbUpdateError(
+            "Export DLPD kosong untuk semua status verifikasi "
+            f"({', '.join(paths)}) - cek BLTH dan Kd Proses yang dipilih")
+
+    hasil = pd.concat(frames, ignore_index=True, sort=False)
+    kunci = _idpel_teks(hasil["idpel"])
+    hasil = hasil[~kunci.duplicated(keep="last")]
+    _tulis_xlsx(hasil, path_keluar)
+    stat["n_total"] = len(hasil)
+    return stat
+
+
 def gabung_dlpd_dpm(path_dlpd, path_dpm, path_keluar):
     """Gabungkan kelainan_bc_meter DPM ke keterangan_dlpd DLPD.
 

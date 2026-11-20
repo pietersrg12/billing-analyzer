@@ -201,6 +201,23 @@ UNDUHAN_DIR = user_path("unduhan")      # arsip file mentah hasil download
 DB_BACKUP_DIR = user_path("db_backup")  # salinan database sebelum ditimpa
 
 # =========================
+# KOREKSI BILLING
+# =========================
+ENABLE_KOREKSI = True   # False = tab Koreksi tidak ditampilkan
+
+# Kirim menulis ke billing produksi dan tidak ada undo. False = tombol Kirim
+# terkunci; Load dan Simulasi tetap jalan.
+ENABLE_KOREKSI_KIRIM = True
+
+# Jumlah IDPEL yang diproses bersamaan. Server produksi yang batas bebannya belum
+# diketahui, jadi naikkan hanya setelah uji nyata; 1 = berurutan.
+KOREKSI_PEKERJA = 4         # Load & Simulasi
+KOREKSI_PEKERJA_KIRIM = 4   # Kirim; dipisah supaya bisa diturunkan sendiri
+
+KOREKSI_ORIGIN = "http://10.68.35.109"  # frontend portal; ditiru dari capture
+KOREKSI_LOG_DIR = user_path("koreksi_log")  # jurnal append-only per unit/bulan
+
+# =========================
 # RULE SETTINGS (threshold anomali, bisa diubah via UI)
 # =========================
 RULE_SETTINGS_FILE = user_path("rule_settings.json")

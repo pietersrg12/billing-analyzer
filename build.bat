@@ -40,7 +40,7 @@ if not exist assets\icon.ico (
 
 echo.
 echo === [3/5] Mengacak kode dengan PyArmor ===
-python -m pyarmor.cli gen -O build_obf --recursive main.py ui.py ui_dialogs.py config.py core
+python -m pyarmor.cli gen -O build_obf --recursive main.py ui.py ui_dialogs.py ui_koreksi.py config.py core
 if errorlevel 1 (
     echo ERROR: PyArmor gagal.
     echo        Pastikan sudah terpasang: pip install pyarmor

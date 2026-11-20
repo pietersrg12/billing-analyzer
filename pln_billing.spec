@@ -39,7 +39,7 @@ if not _os.path.exists(_os.path.join(OBF_DIR, "main.py")):
     raise SystemExit(
         "build_obf/main.py tidak ada. Jalankan dulu:\n"
         "  pyarmor gen -O build_obf --recursive "
-        "main.py ui.py ui_dialogs.py config.py core"
+        "main.py ui.py ui_dialogs.py ui_koreksi.py config.py core"
     )
 
 
@@ -51,7 +51,9 @@ datas = []
 binaries = []
 hiddenimports = []
 
-for pkg in ("ultralytics", "torch", "torchvision", "msoffcrypto"):
+# webview = pywebview untuk jendela login SSO IAM portal billing (core/sso_iam.py);
+# backend WinForms/WebView2-nya memuat DLL lewat pythonnet (`clr`).
+for pkg in ("ultralytics", "torch", "torchvision", "msoffcrypto", "webview"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
     datas += pkg_datas
     binaries += pkg_binaries
@@ -127,7 +129,7 @@ hiddenimports += collect_submodules("ultralytics")
 
 # Modul kita sendiri. Tanpa ini PyInstaller tidak membundelnya sama sekali,
 # karena satu-satunya yang terlihat di build_obf/main.py adalah blob PyArmor.
-hiddenimports += ["config", "ui", "ui_dialogs", "core"]
+hiddenimports += ["config", "ui", "ui_dialogs", "ui_koreksi", "core"]
 hiddenimports += [
     "core." + _os.path.splitext(_os.path.basename(_f))[0]
     for _f in _glob.glob(_os.path.join(OBF_DIR, "core", "*.py"))
@@ -136,6 +138,10 @@ hiddenimports += [
 
 # Paket pihak ketiga yang diimpor DARI DALAM kode teracak.
 hiddenimports += [
+    "clr",
+    "clr_loader",
+    "webview.platforms.winforms",
+    "webview.platforms.edgechromium",
     "pandas",
     "numpy",
     "requests",

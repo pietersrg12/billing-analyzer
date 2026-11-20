@@ -108,7 +108,10 @@ DEFAULT_UNDUH = {
                            "G0", "G1", "PJ", "AP", "KI"],
     "kd_proses_dipilih": ["T0", "T1", "T2"],
     "dlpd": "SEMUA",
-    "status_verifikasi_dlpd": "BELUM",
+    # Status verifikasi DLPD tidak lagi disetel di sini: Unduh DLPD selalu
+    # menarik BELUM + SUDAH (pipeline.STATUS_VERIFIKASI_DLPD). Setelan lama
+    # "BELUM" membuat unduhan gagal setelah periode billing, saat semua DLPD
+    # sudah diverifikasi.
     "kodeposting_dpm": "SUDAH",
     # Kode kelainan_bc_meter yang masuk Daftar Pagar Terkunci (aturan B).
     # Dicocokkan toleran (awalan / mengandung, spasi diabaikan) - lihat

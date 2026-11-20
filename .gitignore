@@ -21,6 +21,8 @@ billing_token.json
 rule_settings.json
 selftest.log
 error.log
+koreksi_log/
+sso_webview/
 
 # Bobot model (besar, di-bundle terpisah saat build)
 model/
@@ -82,3 +84,4 @@ unduh_settings.json
 
 # Dataset machine learning (foto pelanggan - jangan di-commit)
 ml_data/
+cache/

@@ -9,6 +9,13 @@ STATUS_JAM_TINGGI = ">720JN"
 # tandai_tagih_ulang_pasca_nol - rule ini jalan setelah ACMT ditempel.
 STATUS_PASCA_NOL = "Tagih Ulang Pasca Nol"
 
+# Rekening minimum: billing menagih minimal 40 jam nyala walau stand nyaris
+# tidak bergerak, jadi selisih stand < pemakaian itu WAJAR. Dulu masuk "Stand
+# Tidak Wajar" dan membanjirinya (662 dari 665 baris di 202611; user memilih
+# BIARKAN untuk 637 dari 638 di 202610). Status sendiri, tanpa unduh foto.
+STATUS_REKENING_MINIMUM = "Rekening Minimum"
+JAM_REKENING_MINIMUM = 40
+
 # =========================
 # RULES
 # =========================
@@ -60,7 +67,10 @@ def rule_stand_tidak_wajar(r, cfg):
     selisih = r["STAND_KINI"] - r["STAND_LALU"]
     if r["PEMAKAIAN"] > 0 and r["STAND_LALU"] > 0:
         if selisih != r["PEMAKAIAN"] and abs(selisih - r["PEMAKAIAN"]) > cfg["stand_tidak_wajar_toleransi"]:
-            return "Stand Tidak Wajar",f"Selisih={selisih:.0f}, Pakai={r['PEMAKAIAN']:.0f}"
+            detail = f"Selisih={selisih:.0f}, Pakai={r['PEMAKAIAN']:.0f}"
+            if r["JAM_NYALA"] <= JAM_REKENING_MINIMUM and 0 <= selisih < r["PEMAKAIAN"]:
+                return STATUS_REKENING_MINIMUM, detail
+            return "Stand Tidak Wajar", detail
     return None
 
 # NOTE: rule "Anomali vs Sejawat" (peer median) dihapus 2026-07 atas
@@ -90,6 +100,11 @@ RULES = [
 def prepare(df, db, cfg):
 
     n_bulan = cfg["jumlah_bulan_rata2"]
+
+    # Semua agregat di bawah per-IDPEL lalu di-merge kiri ke df, jadi baris DB
+    # pelanggan lain tidak pernah terpakai. Disaring dulu supaya tidak ikut
+    # dihitung (hasil identik, diuji assert_frame_equal pada 9.168 baris).
+    db = db[db["IDPEL"].isin(df["IDPEL"])]
 
     db_sorted = db.sort_values(["IDPEL","BULAN"])
     last = db_sorted.groupby("IDPEL").tail(1)

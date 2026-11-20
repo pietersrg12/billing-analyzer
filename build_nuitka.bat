@@ -44,8 +44,15 @@ python -m nuitka tools\nuitka_entry.py ^
     --include-module=main ^
     --include-module=ui ^
     --include-module=ui_dialogs ^
+    --include-module=ui_koreksi ^
     --include-package=core ^
     --include-package=msoffcrypto ^
+    --include-package=webview ^
+    --include-package-data=webview ^
+    --include-module=clr ^
+    --include-package=clr_loader ^
+    --include-package-data=clr_loader ^
+    --include-package-data=pythonnet ^
     --include-module=xlsxwriter ^
     --include-module=pyxlsb ^
     --include-package-data=tkinterdnd2 ^

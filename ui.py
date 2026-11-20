@@ -26,6 +26,7 @@ from core.pipeline import (
 )
 from core import settings
 from ui_dialogs import DialogMixin, muat_logo
+from ui_koreksi import HalamanKoreksi
 from config import (
     APP_NAMA,
     APP_PEMBUAT,
@@ -34,6 +35,7 @@ from config import (
     APP_TEMPAT,
     APP_VERSI,
     ENABLE_DB_DOWNLOAD,
+    ENABLE_KOREKSI,
     ENABLE_UNDUH_DLPD,
     LOGO_EMBLEM_PATH,
     THEME_DARK,
@@ -154,10 +156,14 @@ class App(DialogMixin):
         self.billing_credentials_holder = CredentialsHolder()
 
         self._build_header()
+        self._build_tab_utama()
         self._build_input_section()
         self._build_progress_section()
         self._build_action_buttons()
         self._build_log_section()
+        if self.tab_utama is not None:
+            self.halaman_koreksi = HalamanKoreksi(self.tab_utama, self)
+            self.tab_utama.add(self.halaman_koreksi, text="   Koreksi   ")
 
         self._perbarui_label_unit()
 
@@ -172,6 +178,14 @@ class App(DialogMixin):
         Logout best-effort: dijalankan di thread dengan batas tunggu pendek
         supaya kegagalan/lambatnya server tidak membuat window menggantung.
         """
+        koreksi = getattr(self, "halaman_koreksi", None)
+        if koreksi is not None and koreksi.tugas == "kirim":
+            # Menutup di tengah POST membuat status baris itu tidak pasti.
+            if not messagebox.askyesno(
+                "Koreksi sedang dikirim",
+                "Pengiriman koreksi masih berjalan. Tutup aplikasi sekarang?",
+            ):
+                return
         if self.running:
             # Operasi masih jalan: minta berhenti dulu supaya tidak ada request
             # ACMT yang menabrak logout.
@@ -184,6 +198,27 @@ class App(DialogMixin):
         except Exception:
             pass
         self.root.destroy()
+
+    # ── TAB UTAMA ─────────────────────────────────────────
+
+    def _build_tab_utama(self):
+        """Tab Analisa | Koreksi. Tanpa ENABLE_KOREKSI, halaman Analisa langsung
+        di root seperti sebelumnya."""
+        self.halaman_koreksi = None
+        if not ENABLE_KOREKSI:
+            self.tab_utama = None
+            self.halaman_analisa = self.root
+            return
+        self.tab_utama = tb.Notebook(self.root)
+        self.tab_utama.pack(fill=BOTH, expand=True)
+        self.halaman_analisa = tb.Frame(self.tab_utama)
+        self.tab_utama.add(self.halaman_analisa, text="   Analisa   ")
+
+    def _tab_koreksi_aktif(self):
+        return (
+            self.tab_utama is not None
+            and self.tab_utama.select() == str(self.halaman_koreksi)
+        )
 
     # ── HEADER ────────────────────────────────────────────
 
@@ -298,7 +333,7 @@ class App(DialogMixin):
     # ── INPUT SECTION ─────────────────────────────────────
 
     def _build_input_section(self):
-        frame = tb.LabelFrame(self.root, text="  Input Data  ")
+        frame = tb.LabelFrame(self.halaman_analisa, text="  Input Data  ")
         frame.pack(fill=X, padx=15, pady=(15, 5), ipadx=10, ipady=8)
 
         # Row 1: File path
@@ -452,13 +487,16 @@ class App(DialogMixin):
     def _on_drop(self, event):
         path = event.data.strip("{}")
         if os.path.isfile(path):
+            if self._tab_koreksi_aktif():
+                self.halaman_koreksi.pilih_file(path)
+                return
             self.path_var.set(path)
             self._autofill_blth(path)
 
     # ── PROGRESS SECTION ──────────────────────────────────
 
     def _build_progress_section(self):
-        frame = tb.LabelFrame(self.root, text="  Progress  ")
+        frame = tb.LabelFrame(self.halaman_analisa, text="  Progress  ")
         frame.pack(fill=X, padx=15, pady=5, ipadx=10, ipady=8)
 
         # Step indicators
@@ -571,7 +609,7 @@ class App(DialogMixin):
     # ── ACTION BUTTONS ────────────────────────────────────
 
     def _build_action_buttons(self):
-        frame = tb.Frame(self.root)
+        frame = tb.Frame(self.halaman_analisa)
         frame.pack(fill=X, padx=15, pady=10)
 
         self.run_btn = tb.Button(
@@ -610,11 +648,13 @@ class App(DialogMixin):
             self.unduh_dlpd_btn.config(state=state_run)
         if getattr(self, "unit_btn", None) is not None:
             self.unit_btn.config(state=state_run)
+        if getattr(self, "halaman_koreksi", None) is not None:
+            self.halaman_koreksi.perbarui()
 
     # ── LOG SECTION ───────────────────────────────────────
 
     def _build_log_section(self):
-        frame = tb.LabelFrame(self.root, text="  Log Aktivitas  ")
+        frame = tb.LabelFrame(self.halaman_analisa, text="  Log Aktivitas  ")
         frame.pack(fill=BOTH, expand=True, padx=15, pady=(5, 15), ipadx=8, ipady=8)
 
         self.log_text = ScrolledText(
@@ -997,6 +1037,9 @@ class App(DialogMixin):
 
                 elif kind == "unduh_dlpd_done":
                     self._finish_unduh_dlpd(data)
+
+                elif kind.startswith("koreksi_"):
+                    self.halaman_koreksi.terima(kind, data)
 
                 elif kind == "verification_required":
                     self.status_label.config(text="Menunggu verifikasi database...", bootstyle=WARNING)
